@@ -1,4 +1,4 @@
-use crate::{Error, Result, WasiCtx};
+use crate::{Error, WasiCtx};
 use tracing::debug;
 
 wiggle::from_witx!({
@@ -23,9 +23,11 @@ impl types::GuestErrorConversion for WasiCtx {
 }
 
 impl types::UserErrorConversion for WasiCtx {
-    fn errno_from_error(&self, e: Error) -> Errno {
+    // TLC TODO: Enhance this implementation of UserErrorConversion to
+    // return a well-formed result instead of an i32.
+    fn errno_from_error(&self, e: Error) -> Result<Errno, String> {
         debug!("Error: {:?}", e);
-        e.into()
+        Ok(e.into())
     }
 }
 
@@ -103,11 +105,11 @@ impl From<std::fs::FileType> for types::Filetype {
 }
 
 pub(crate) trait AsBytes {
-    fn as_bytes(&self) -> Result<Vec<u8>>;
+    fn as_bytes(&self) -> Result<Vec<u8>, Error>;
 }
 
 impl AsBytes for types::Dirent {
-    fn as_bytes(&self) -> Result<Vec<u8>> {
+    fn as_bytes(&self) -> Result<Vec<u8>, Error> {
         use std::convert::TryInto;
         use wiggle::GuestType;
 
