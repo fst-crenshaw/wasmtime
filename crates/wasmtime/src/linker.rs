@@ -516,6 +516,10 @@ impl Linker {
             ExternType::Global(f) => ImportKind::Global(f),
             ExternType::Memory(_) => ImportKind::Memory,
             ExternType::Table(_) => ImportKind::Table,
+
+            // FIXME(#2094)
+            ExternType::Module(_) => unimplemented!(),
+            ExternType::Instance(_) => unimplemented!(),
         }
     }
 
@@ -716,7 +720,7 @@ impl Linker {
         // Otherwise return a no-op function.
         Ok(Func::new(
             &self.store,
-            FuncType::new(Vec::new().into_boxed_slice(), Vec::new().into_boxed_slice()),
+            FuncType::new(None, None),
             move |_, _, _| Ok(()),
         ))
     }

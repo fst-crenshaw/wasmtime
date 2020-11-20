@@ -13,11 +13,11 @@ cranelift-codegen = { path = "../cranelift/codegen" }
 cranelift-reader = { path = "../cranelift/reader" }
 cranelift-wasm = { path = "../cranelift/wasm" }
 libfuzzer-sys = "0.3.3"
-target-lexicon = "0.10"
+target-lexicon = "0.11"
 peepmatic-fuzzing = { path = "../cranelift/peepmatic/crates/fuzzing", optional = true }
 wasmtime = { path = "../crates/wasmtime" }
 wasmtime-fuzzing = { path = "../crates/fuzzing" }
-wasm-smith = "0.1.3"
+wasm-smith = "0.1.5"
 
 [[bin]]
 name = "compile"
@@ -32,25 +32,16 @@ test = false
 doc = false
 
 [[bin]]
-name = "instantiate_translated"
-path = "fuzz_targets/instantiate_translated.rs"
-test = false
-doc = false
-required-features = ["binaryen"]
-
-[[bin]]
 name = "api_calls"
 path = "fuzz_targets/api_calls.rs"
 test = false
 doc = false
-required-features = ["binaryen"]
 
 [[bin]]
 name = "differential"
 path = "fuzz_targets/differential.rs"
 test = false
 doc = false
-required-features = ["binaryen"]
 
 [[bin]]
 name = "spectests"
@@ -99,11 +90,20 @@ test = false
 doc = false
 required-features = ["peepmatic-fuzzing"]
 
-[features]
-binaryen = ["wasmtime-fuzzing/binaryen"]
-
 [[bin]]
 name = "instantiate-wasm-smith"
 path = "fuzz_targets/instantiate-wasm-smith.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "instantiate-swarm"
+path = "fuzz_targets/instantiate-swarm.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "instantiate-maybe-invalid"
+path = "fuzz_targets/instantiate-maybe-invalid.rs"
 test = false
 doc = false

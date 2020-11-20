@@ -1,12 +1,12 @@
 use cranelift::prelude::*;
 use cranelift_codegen::binemit::NullTrapSink;
 use cranelift_module::{default_libcall_names, Linkage, Module};
-use cranelift_simplejit::{SimpleJITBackend, SimpleJITBuilder};
+use cranelift_simplejit::{SimpleJITBuilder, SimpleJITModule};
 use std::mem;
 
 fn main() {
-    let mut module: Module<SimpleJITBackend> =
-        Module::new(SimpleJITBuilder::new(default_libcall_names()));
+    let mut module: SimpleJITModule =
+        SimpleJITModule::new(SimpleJITBuilder::new(default_libcall_names()));
     let mut ctx = module.make_context();
     let mut func_ctx = FunctionBuilderContext::new();
 

@@ -12,8 +12,9 @@ use wasmtime_environ::wasm::{
     GlobalIndex, MemoryIndex, SignatureIndex, TableIndex,
 };
 use wasmtime_environ::{
-    BuiltinFunctionIndex, CompileError, CompiledFunction, Compiler, FunctionBodyData, Module,
-    ModuleTranslation, Relocation, RelocationTarget, TrapInformation, VMOffsets,
+    entity::PrimaryMap, BuiltinFunctionIndex, CompileError, CompiledFunction, Compiler,
+    FunctionBodyData, Module, ModuleTranslation, Relocation, RelocationTarget, TrapInformation,
+    Tunables, VMOffsets,
 };
 
 /// A compiler that compiles a WebAssembly module with Lightbeam, directly translating the Wasm file.
@@ -24,15 +25,16 @@ impl Compiler for Lightbeam {
         &self,
         translation: &ModuleTranslation,
         i: DefinedFuncIndex,
-        function_body: &FunctionBodyData<'_>,
+        function_body: FunctionBodyData<'_>,
         isa: &dyn isa::TargetIsa,
+        tunables: &Tunables,
     ) -> Result<CompiledFunction, CompileError> {
-        if translation.tunables.debug_info {
+        if tunables.debug_info {
             return Err(CompileError::DebugInfoNotSupported);
         }
         let func_index = translation.module.func_index(i);
 
-        let env = FuncEnvironment::new(isa.frontend_config().pointer_bytes(), &translation.module);
+        let env = FuncEnvironment::new(isa.frontend_config().pointer_bytes(), translation);
         let mut codegen_session: CodeGenSession<_> = CodeGenSession::new(
             translation.function_body_inputs.len() as u32,
             &env,
@@ -49,7 +51,7 @@ impl Compiler for Lightbeam {
                 offsets: &mut NullOffsetSink,
             },
             i.as_u32(),
-            wasmparser::FunctionBody::new(0, function_body.data),
+            function_body.body,
         )
         .map_err(|e| CompileError::Codegen(format!("Failed to translate function: {}", e)))?;
 
@@ -84,15 +86,6 @@ struct RelocSink {
 }
 
 impl binemit::RelocSink for RelocSink {
-    fn reloc_block(
-        &mut self,
-        _offset: binemit::CodeOffset,
-        _reloc: binemit::Reloc,
-        _block_offset: binemit::CodeOffset,
-    ) {
-        // This should use the `offsets` field of `ir::Function`.
-        panic!("block headers not yet implemented");
-    }
     fn reloc_external(
         &mut self,
         offset: binemit::CodeOffset,
@@ -165,12 +158,11 @@ impl binemit::TrapSink for TrapSink {
     fn trap(
         &mut self,
         code_offset: binemit::CodeOffset,
-        source_loc: ir::SourceLoc,
+        _source_loc: ir::SourceLoc,
         trap_code: ir::TrapCode,
     ) {
         self.traps.push(TrapInformation {
             code_offset,
-            source_loc,
             trap_code,
         });
     }
@@ -181,15 +173,18 @@ struct FuncEnvironment<'module_environment> {
     /// The module-level environment which this function-level environment belongs to.
     module: &'module_environment Module,
 
+    native_signatures: &'module_environment PrimaryMap<SignatureIndex, ir::Signature>,
+
     /// Offsets to struct fields accessed by JIT code.
     offsets: VMOffsets,
 }
 
 impl<'module_environment> FuncEnvironment<'module_environment> {
-    fn new(pointer_bytes: u8, module: &'module_environment Module) -> Self {
+    fn new(pointer_bytes: u8, translation: &'module_environment ModuleTranslation<'_>) -> Self {
         Self {
-            module,
-            offsets: VMOffsets::new(pointer_bytes, module),
+            module: &translation.module,
+            offsets: VMOffsets::new(pointer_bytes, &translation.module),
+            native_signatures: &translation.native_signatures,
         }
     }
 }
@@ -228,7 +223,7 @@ impl lightbeam::ModuleContext for FuncEnvironment<'_> {
     }
 
     fn signature(&self, index: u32) -> &Self::Signature {
-        &self.module.signatures[SignatureIndex::from_u32(index)].1
+        &self.native_signatures[SignatureIndex::from_u32(index)]
     }
 
     fn defined_table_index(&self, table_index: u32) -> Option<u32> {

@@ -6,19 +6,18 @@ use crate::{FuncType, Store, Trap};
 use anyhow::Result;
 use std::any::Any;
 use std::cmp;
-use std::collections::HashMap;
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use wasmtime_environ::entity::PrimaryMap;
 use wasmtime_environ::isa::TargetIsa;
-use wasmtime_environ::{ir, settings, CompiledFunction, EntityIndex, Module};
+use wasmtime_environ::{ir, wasm, CompiledFunction, Module};
 use wasmtime_jit::trampoline::ir::{
     ExternalName, Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind,
 };
 use wasmtime_jit::trampoline::{
     self, binemit, pretty_error, Context, FunctionBuilder, FunctionBuilderContext,
 };
-use wasmtime_jit::{native, CodeMemory};
+use wasmtime_jit::CodeMemory;
 use wasmtime_runtime::{InstanceHandle, VMContext, VMFunctionBody, VMTrampoline};
 
 struct TrampolineState {
@@ -128,10 +127,6 @@ fn make_trampoline(
         let values_vec_ptr_val = builder.ins().stack_addr(pointer_type, ss, 0);
         let mflags = MemFlags::trusted();
         for i in 2..signature.params.len() {
-            if i == 0 {
-                continue;
-            }
-
             let val = builder.func.dfg.block_params(block0)[i];
             builder.ins().store(
                 mflags,
@@ -219,22 +214,20 @@ pub fn create_handle_with_function(
 
     let pointer_type = isa.pointer_type();
     let sig = ft.get_wasmtime_signature(pointer_type);
+    let wft = ft.as_wasm_func_type();
 
     let mut fn_builder_ctx = FunctionBuilderContext::new();
     let mut module = Module::new();
     let mut finished_functions = PrimaryMap::new();
-    let mut trampolines = HashMap::new();
     let mut code_memory = CodeMemory::new();
 
     // First up we manufacture a trampoline which has the ABI specified by `ft`
     // and calls into `stub_fn`...
-    let sig_id = module
-        .signatures
-        .push((ft.to_wasm_func_type(), sig.clone()));
+    let sig_id = module.signatures.push(wft.clone());
     let func_id = module.functions.push(sig_id);
     module
         .exports
-        .insert("trampoline".to_string(), EntityIndex::Function(func_id));
+        .insert(String::new(), wasm::EntityIndex::Function(func_id));
     let trampoline = make_trampoline(isa.as_ref(), &mut code_memory, &mut fn_builder_ctx, &sig);
     finished_functions.push(trampoline);
 
@@ -248,8 +241,7 @@ pub fn create_handle_with_function(
         &sig,
         mem::size_of::<u128>(),
     )?;
-    let sig_id = store.register_signature(ft.to_wasm_func_type(), sig);
-    trampolines.insert(sig_id, trampoline);
+    store.signatures().borrow_mut().register(wft, trampoline);
 
     // Next up we wrap everything up into an `InstanceHandle` by publishing our
     // code memory (makes it executable) and ensuring all our various bits of
@@ -260,7 +252,6 @@ pub fn create_handle_with_function(
         module,
         store,
         finished_functions,
-        trampolines,
         Box::new(trampoline_state),
         &[],
     )
@@ -274,29 +265,18 @@ pub unsafe fn create_handle_with_raw_function(
     store: &Store,
     state: Box<dyn Any>,
 ) -> Result<StoreInstanceHandle> {
-    let isa = {
-        let isa_builder = native::builder();
-        let flag_builder = settings::builder();
-        isa_builder.finish(settings::Flags::new(flag_builder))
-    };
-
-    let pointer_type = isa.pointer_type();
-    let sig = ft.get_wasmtime_signature(pointer_type);
+    let wft = ft.as_wasm_func_type();
 
     let mut module = Module::new();
     let mut finished_functions = PrimaryMap::new();
-    let mut trampolines = HashMap::new();
 
-    let sig_id = module
-        .signatures
-        .push((ft.to_wasm_func_type(), sig.clone()));
+    let sig_id = module.signatures.push(wft.clone());
     let func_id = module.functions.push(sig_id);
     module
         .exports
-        .insert("trampoline".to_string(), EntityIndex::Function(func_id));
+        .insert(String::new(), wasm::EntityIndex::Function(func_id));
     finished_functions.push(func);
-    let sig_id = store.register_signature(ft.to_wasm_func_type(), sig);
-    trampolines.insert(sig_id, trampoline);
+    store.signatures().borrow_mut().register(wft, trampoline);
 
-    create_handle(module, store, finished_functions, trampolines, state, &[])
+    create_handle(module, store, finished_functions, state, &[])
 }

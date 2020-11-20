@@ -13,7 +13,7 @@ fn test_trap_return() -> Result<()> {
     "#;
 
     let module = Module::new(store.engine(), wat)?;
-    let hello_type = FuncType::new(Box::new([]), Box::new([]));
+    let hello_type = FuncType::new(None, None);
     let hello_func = Func::new(&store, hello_type, |_, _, _| Err(Trap::new("test 123")));
 
     let instance = Instance::new(&store, &module, &[hello_func.into()])?;
@@ -31,8 +31,8 @@ fn test_trap_return() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn test_trap_trace() -> Result<()> {
     let store = Store::default();
     let wat = r#"
@@ -74,8 +74,8 @@ fn test_trap_trace() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn test_trap_trace_cb() -> Result<()> {
     let store = Store::default();
     let wat = r#"
@@ -86,7 +86,7 @@ fn test_trap_trace_cb() -> Result<()> {
         )
     "#;
 
-    let fn_type = FuncType::new(Box::new([]), Box::new([]));
+    let fn_type = FuncType::new(None, None);
     let fn_func = Func::new(&store, fn_type, |_, _, _| Err(Trap::new("cb throw")));
 
     let module = Module::new(store.engine(), wat)?;
@@ -111,8 +111,8 @@ fn test_trap_trace_cb() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn test_trap_stack_overflow() -> Result<()> {
     let store = Store::default();
     let wat = r#"
@@ -144,8 +144,8 @@ fn test_trap_stack_overflow() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn trap_display_pretty() -> Result<()> {
     let store = Store::default();
     let wat = r#"
@@ -177,8 +177,8 @@ wasm backtrace:
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn trap_display_multi_module() -> Result<()> {
     let store = Store::default();
     let wat = r#"
@@ -223,8 +223,8 @@ wasm backtrace:
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn trap_start_function_import() -> Result<()> {
     let store = Store::default();
     let binary = wat::parse_str(
@@ -237,7 +237,7 @@ fn trap_start_function_import() -> Result<()> {
     )?;
 
     let module = Module::new(store.engine(), &binary)?;
-    let sig = FuncType::new(Box::new([]), Box::new([]));
+    let sig = FuncType::new(None, None);
     let func = Func::new(&store, sig, |_, _, _| Err(Trap::new("user trap")));
     let err = Instance::new(&store, &module, &[func.into()])
         .err()
@@ -251,8 +251,8 @@ fn trap_start_function_import() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn rust_panic_import() -> Result<()> {
     let store = Store::default();
     let binary = wat::parse_str(
@@ -267,7 +267,7 @@ fn rust_panic_import() -> Result<()> {
     )?;
 
     let module = Module::new(store.engine(), &binary)?;
-    let sig = FuncType::new(Box::new([]), Box::new([]));
+    let sig = FuncType::new(None, None);
     let func = Func::new(&store, sig, |_, _, _| panic!("this is a panic"));
     let instance = Instance::new(
         &store,
@@ -297,8 +297,8 @@ fn rust_panic_import() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn rust_panic_start_function() -> Result<()> {
     let store = Store::default();
     let binary = wat::parse_str(
@@ -311,7 +311,7 @@ fn rust_panic_start_function() -> Result<()> {
     )?;
 
     let module = Module::new(store.engine(), &binary)?;
-    let sig = FuncType::new(Box::new([]), Box::new([]));
+    let sig = FuncType::new(None, None);
     let func = Func::new(&store, sig, |_, _, _| panic!("this is a panic"));
     let err = panic::catch_unwind(AssertUnwindSafe(|| {
         drop(Instance::new(&store, &module, &[func.into()]));
@@ -332,8 +332,8 @@ fn rust_panic_start_function() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn mismatched_arguments() -> Result<()> {
     let store = Store::default();
     let binary = wat::parse_str(
@@ -365,8 +365,8 @@ fn mismatched_arguments() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn call_signature_mismatch() -> Result<()> {
     let store = Store::default();
     let binary = wat::parse_str(
@@ -397,8 +397,8 @@ fn call_signature_mismatch() -> Result<()> {
 }
 
 #[test]
-#[cfg_attr(target_arch = "aarch64", ignore)] // FIXME(#1642)
-#[cfg_attr(feature = "experimental_x64", ignore)] // FIXME(#2078)
+#[cfg_attr(all(target_os = "windows", target_arch = "aarch64"), ignore)] // FIXME(#1642)
+#[cfg_attr(all(target_os = "windows", feature = "experimental_x64"), ignore)] // FIXME(#2079)
 fn start_trap_pretty() -> Result<()> {
     let store = Store::default();
     let wat = r#"
@@ -451,4 +451,41 @@ fn present_after_module_drop() -> Result<()> {
         assert_eq!(t.trace().len(), 1);
         assert_eq!(t.trace()[0].func_index(), 0);
     }
+}
+
+fn assert_trap_code(wat: &str, code: wasmtime::TrapCode) {
+    let store = Store::default();
+    let module = Module::new(store.engine(), wat).unwrap();
+
+    let err = match Instance::new(&store, &module, &[]) {
+        Ok(_) => unreachable!(),
+        Err(e) => e,
+    };
+    let trap = err.downcast_ref::<Trap>().unwrap();
+    assert_eq!(trap.trap_code(), Some(code));
+}
+
+#[test]
+fn heap_out_of_bounds_trap() {
+    assert_trap_code(
+        r#"
+            (module
+              (memory 0)
+              (func $start (drop (i32.load (i32.const 1000000))))
+              (start $start)
+            )
+         "#,
+        TrapCode::MemoryOutOfBounds,
+    );
+
+    assert_trap_code(
+        r#"
+            (module
+              (memory 0)
+              (func $start (drop (i32.load memory.size)))
+              (start $start)
+            )
+         "#,
+        TrapCode::MemoryOutOfBounds,
+    );
 }

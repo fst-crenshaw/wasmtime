@@ -16,9 +16,8 @@
     warn(
         clippy::mut_mut,
         clippy::nonminimal_bool,
-        clippy::option_map_unwrap_or,
-        clippy::option_map_unwrap_or_else,
-        clippy::unicode_not_nfc,
+        clippy::map_unwrap_or,
+        clippy::clippy::unicode_not_nfc,
         clippy::use_self
     )
 )]
@@ -60,9 +59,6 @@ mod test_stack_maps;
 mod test_unwind;
 mod test_verifier;
 
-/// The result of running the test in a file.
-type TestResult = Result<time::Duration, String>;
-
 /// Main entry point for `clif-util test`.
 ///
 /// Take a list of filenames which can be either `.clif` files or directories.
@@ -72,7 +68,7 @@ type TestResult = Result<time::Duration, String>;
 /// Directories are scanned recursively for test cases ending in `.clif`. These test cases are
 /// executed on background threads.
 ///
-pub fn run(verbose: bool, report_times: bool, files: &[String]) -> TestResult {
+pub fn run(verbose: bool, report_times: bool, files: &[String]) -> anyhow::Result<time::Duration> {
     let mut runner = TestRunner::new(verbose, report_times);
 
     for path in files.iter().map(Path::new) {
@@ -98,7 +94,7 @@ pub fn run_passes(
     passes: &[String],
     target: &str,
     file: &str,
-) -> TestResult {
+) -> anyhow::Result<time::Duration> {
     let mut runner = TestRunner::new(verbose, /* report_times */ false);
 
     let path = Path::new(file);
@@ -119,7 +115,7 @@ pub fn run_passes(
 ///
 /// This function knows how to create all of the possible `test <foo>` commands that can appear in
 /// a `.clif` test file.
-fn new_subtest(parsed: &TestCommand) -> subtest::SubtestResult<Box<dyn subtest::SubTest>> {
+fn new_subtest(parsed: &TestCommand) -> anyhow::Result<Box<dyn subtest::SubTest>> {
     match parsed.command {
         "binemit" => test_binemit::subtest(parsed),
         "cat" => test_cat::subtest(parsed),
@@ -143,6 +139,15 @@ fn new_subtest(parsed: &TestCommand) -> subtest::SubtestResult<Box<dyn subtest::
         "stack_maps" => test_stack_maps::subtest(parsed),
         "unwind" => test_unwind::subtest(parsed),
         "verifier" => test_verifier::subtest(parsed),
-        _ => Err(format!("unknown test command '{}'", parsed.command)),
+        _ => anyhow::bail!("unknown test command '{}'", parsed.command),
     }
+}
+
+fn pretty_anyhow_error(
+    func: &cranelift_codegen::ir::Function,
+    isa: Option<&dyn cranelift_codegen::isa::TargetIsa>,
+    err: cranelift_codegen::CodegenError,
+) -> anyhow::Error {
+    let s = cranelift_codegen::print_errors::pretty_error(func, isa, err);
+    anyhow::anyhow!("{}", s)
 }

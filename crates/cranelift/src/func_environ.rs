@@ -5,11 +5,11 @@ use cranelift_codegen::ir::immediates::{Offset32, Uimm64};
 use cranelift_codegen::ir::types::*;
 use cranelift_codegen::ir::{AbiParam, ArgumentPurpose, Function, InstBuilder, Signature};
 use cranelift_codegen::isa::{self, TargetFrontendConfig};
-use cranelift_entity::EntityRef;
+use cranelift_entity::{EntityRef, PrimaryMap};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_wasm::{
     self, FuncIndex, GlobalIndex, GlobalVariable, MemoryIndex, SignatureIndex, TableIndex,
-    TargetEnvironment, WasmError, WasmResult, WasmType,
+    TargetEnvironment, TypeIndex, WasmError, WasmResult, WasmType,
 };
 use std::convert::TryFrom;
 use wasmtime_environ::{
@@ -69,7 +69,16 @@ macro_rules! declare_function_signatures {
             }
 
             fn i32(&self) -> AbiParam {
-                AbiParam::new(I32)
+                // Some platform ABIs require i32 values to be zero- or sign-
+                // extended to the full register width.  We need to indicate
+                // this here by using the appropriate .uext or .sext attribute.
+                // The attribute can be added unconditionally; platforms whose
+                // ABI does not require such extensions will simply ignore it.
+                // Note that currently all i32 arguments or return values used
+                // by builtin functions are unsigned, so we always use .uext.
+                // If that ever changes, we will have to add a second type
+                // marker here.
+                AbiParam::new(I32).uext()
             }
 
             $(
@@ -99,6 +108,9 @@ pub struct FuncEnvironment<'module_environment> {
     /// The module-level environment which this function-level environment belongs to.
     module: &'module_environment Module,
 
+    /// The native signatures for each type signature in this module
+    native_signatures: &'module_environment PrimaryMap<SignatureIndex, ir::Signature>,
+
     /// The Cranelift global holding the vmctx address.
     vmctx: Option<ir::GlobalValue>,
 
@@ -115,6 +127,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     pub fn new(
         target_config: TargetFrontendConfig,
         module: &'module_environment Module,
+        native_signatures: &'module_environment PrimaryMap<SignatureIndex, ir::Signature>,
         tunables: &'module_environment Tunables,
     ) -> Self {
         let builtin_function_signatures = BuiltinFunctionSignatures::new(
@@ -129,6 +142,7 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
         Self {
             target_config,
             module,
+            native_signatures,
             vmctx: None,
             builtin_function_signatures,
             offsets: VMOffsets::new(target_config.pointer_bytes(), module),
@@ -222,26 +236,6 @@ impl<'module_environment> FuncEnvironment<'module_environment> {
     fn get_elem_drop_func(&mut self, func: &mut Function) -> (ir::SigRef, BuiltinFunctionIndex) {
         let sig = self.builtin_function_signatures.elem_drop(func);
         (sig, BuiltinFunctionIndex::elem_drop())
-    }
-
-    fn get_memory_copy_func(
-        &mut self,
-        func: &mut Function,
-        memory_index: MemoryIndex,
-    ) -> (ir::SigRef, usize, BuiltinFunctionIndex) {
-        if let Some(defined_memory_index) = self.module.defined_memory_index(memory_index) {
-            (
-                self.builtin_function_signatures.defined_memory_copy(func),
-                defined_memory_index.index(),
-                BuiltinFunctionIndex::defined_memory_copy(),
-            )
-        } else {
-            (
-                self.builtin_function_signatures.imported_memory_copy(func),
-                memory_index.index(),
-                BuiltinFunctionIndex::imported_memory_copy(),
-            )
-        }
     }
 
     fn get_memory_fill_func(
@@ -514,6 +508,7 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
 
                 let reference_type = self.reference_type(WasmType::ExternRef);
 
+                builder.ensure_inserted_block();
                 let continue_block = builder.create_block();
                 let non_null_elem_block = builder.create_block();
                 let gc_block = builder.create_block();
@@ -663,6 +658,7 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
                 //    drop the old table element *after* we've replaced it with
                 //    the new `value`!
 
+                builder.ensure_inserted_block();
                 let current_block = builder.current_block().unwrap();
                 let inc_ref_count_block = builder.create_block();
                 builder.insert_block_after(inc_ref_count_block, current_block);
@@ -1009,9 +1005,10 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
     fn make_indirect_sig(
         &mut self,
         func: &mut ir::Function,
-        index: SignatureIndex,
+        index: TypeIndex,
     ) -> WasmResult<ir::SigRef> {
-        Ok(func.import_signature(self.module.signatures[index].1.clone()))
+        let index = self.module.types[index].unwrap_function();
+        Ok(func.import_signature(self.native_signatures[index].clone()))
     }
 
     fn make_direct_func(
@@ -1019,8 +1016,9 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
         func: &mut ir::Function,
         index: FuncIndex,
     ) -> WasmResult<ir::FuncRef> {
-        let sig = self.module.native_func_signature(index);
-        let signature = func.import_signature(sig.clone());
+        let sig_index = self.module.functions[index];
+        let sig = self.native_signatures[sig_index].clone();
+        let signature = func.import_signature(sig);
         let name = get_func_name(index);
         Ok(func.import_function(ir::ExtFuncData {
             name,
@@ -1036,11 +1034,12 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
         mut pos: FuncCursor<'_>,
         table_index: TableIndex,
         table: ir::Table,
-        sig_index: SignatureIndex,
+        ty_index: TypeIndex,
         sig_ref: ir::SigRef,
         callee: ir::Value,
         call_args: &[ir::Value],
     ) -> WasmResult<ir::Inst> {
+        let sig_index = self.module.types[ty_index].unwrap_function();
         let pointer_type = self.pointer_type();
 
         let table_entry_addr = pos.ins().table_addr(pointer_type, table, callee, 0);
@@ -1199,23 +1198,25 @@ impl<'module_environment> cranelift_wasm::FuncEnvironment for FuncEnvironment<'m
     fn translate_memory_copy(
         &mut self,
         mut pos: FuncCursor,
-        memory_index: MemoryIndex,
-        _heap: ir::Heap,
+        src_index: MemoryIndex,
+        _src_heap: ir::Heap,
+        dst_index: MemoryIndex,
+        _dst_heap: ir::Heap,
         dst: ir::Value,
         src: ir::Value,
         len: ir::Value,
     ) -> WasmResult<()> {
-        let (func_sig, memory_index, func_idx) =
-            self.get_memory_copy_func(&mut pos.func, memory_index);
+        let src_index = pos.ins().iconst(I32, i64::from(src_index.as_u32()));
+        let dst_index = pos.ins().iconst(I32, i64::from(dst_index.as_u32()));
 
-        let memory_index_arg = pos.ins().iconst(I32, memory_index as i64);
+        let (vmctx, func_addr) = self
+            .translate_load_builtin_function_address(&mut pos, BuiltinFunctionIndex::memory_copy());
 
-        let (vmctx, func_addr) = self.translate_load_builtin_function_address(&mut pos, func_idx);
-
+        let func_sig = self.builtin_function_signatures.memory_copy(&mut pos.func);
         pos.ins().call_indirect(
             func_sig,
             func_addr,
-            &[vmctx, memory_index_arg, dst, src, len],
+            &[vmctx, dst_index, dst, src_index, src, len],
         );
 
         Ok(())

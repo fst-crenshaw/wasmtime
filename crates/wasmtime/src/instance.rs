@@ -3,7 +3,7 @@ use crate::{Engine, Export, Extern, Func, Global, Memory, Module, Store, Table, 
 use anyhow::{anyhow, bail, Context, Error, Result};
 use std::any::Any;
 use std::mem;
-use wasmtime_environ::EntityIndex;
+use wasmtime_environ::wasm::EntityIndex;
 use wasmtime_jit::CompiledModule;
 use wasmtime_runtime::{
     Imports, InstantiationError, StackMapRegistry, VMContext, VMExternRefActivationsTable,
@@ -16,13 +16,18 @@ fn instantiate(
     imports: Imports<'_>,
     host: Box<dyn Any>,
 ) -> Result<StoreInstanceHandle, Error> {
+    // Register the module just before instantiation to ensure we have a
+    // trampoline registered for every signature and to preserve the module's
+    // compiled JIT code within the `Store`.
+    store.register_module(compiled_module);
+
     let config = store.engine().config();
     let instance = unsafe {
         let instance = compiled_module.instantiate(
             imports,
-            &mut store.signatures_mut(),
+            &store.lookup_shared_signature(compiled_module.module()),
             config.memory_creator.as_ref().map(|a| a as _),
-            store.interrupts().clone(),
+            store.interrupts(),
             host,
             store.externref_activations_table() as *const VMExternRefActivationsTable as *mut _,
             store.stack_map_registry() as *const StackMapRegistry as *mut _,
@@ -38,12 +43,12 @@ fn instantiate(
         let instance = store.add_instance(instance);
         instance
             .initialize(
-                config.wasm_bulk_memory,
+                config.features.bulk_memory,
                 &compiled_module.data_initializers(),
             )
             .map_err(|e| -> Error {
                 match e {
-                    InstantiationError::Trap(trap) => Trap::from_runtime(trap).into(),
+                    InstantiationError::Trap(trap) => Trap::from_runtime(store, trap).into(),
                     other => other.into(),
                 }
             })?;
@@ -98,7 +103,6 @@ fn instantiate(
 #[derive(Clone)]
 pub struct Instance {
     pub(crate) handle: StoreInstanceHandle,
-    store: Store,
     module: Module,
 }
 
@@ -161,20 +165,12 @@ impl Instance {
             bail!("cross-`Engine` instantiation is not currently supported");
         }
 
-        let host_info = Box::new({
-            let frame_info_registration = module.register_frame_info();
-            store.register_jit_code(module.compiled_module().jit_code_ranges());
-            store.register_stack_maps(&module);
-            frame_info_registration
-        });
-
         let handle = with_imports(store, module.compiled_module(), imports, |imports| {
-            instantiate(store, module.compiled_module(), imports, host_info)
+            instantiate(store, module.compiled_module(), imports, Box::new(()))
         })?;
 
         Ok(Instance {
             handle,
-            store: store.clone(),
             module: module.clone(),
         })
     }
@@ -184,7 +180,7 @@ impl Instance {
     /// This is the [`Store`] that generally serves as a sort of global cache
     /// for various instance-related things.
     pub fn store(&self) -> &Store {
-        &self.store
+        &self.handle.store
     }
 
     /// Returns the list of exported items from this [`Instance`].
@@ -295,14 +291,19 @@ fn with_imports<R>(
                 // functions registered with that type, so `func` is guaranteed
                 // to not match.
                 let ty = store
-                    .signatures_mut()
-                    .lookup(&m.signatures[m.functions[i]].0)
+                    .signatures()
+                    .borrow()
+                    .lookup(&m.signatures[m.functions[i]])
                     .ok_or_else(|| anyhow!("function types incompatible"))?;
                 if !func.matches_expected(ty) {
                     bail!("function types incompatible");
                 }
                 functions.push(func.vmimport());
             }
+
+            // FIXME(#2094)
+            EntityIndex::Module(_i) => unimplemented!(),
+            EntityIndex::Instance(_i) => unimplemented!(),
         }
         Ok(())
     };

@@ -22,6 +22,7 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     "peepmatic-test-operator",
     "peepmatic-runtime",
     "peepmatic",
+    "peepmatic-souper",
     // cranelift
     "cranelift-entity",
     "cranelift-bforest",
@@ -63,6 +64,7 @@ const CRATES_TO_PUBLISH: &[&str] = &[
     "wasmtime",
     "wasmtime-wiggle",
     "wasmtime-wasi",
+    "wasmtime-wasi-nn",
     "wasmtime-rust-macro",
     "wasmtime-rust",
     "wasmtime-wast",
@@ -107,6 +109,13 @@ fn main() {
             for krate in crates.iter() {
                 publish(&krate);
             }
+            println!("");
+            println!("===================================================================");
+            println!("");
+            println!("Don't forget to push a git tag for this release!");
+            println!("");
+            println!("    $ git tag vX.Y.Z");
+            println!("    $ git push git@github.com:bytecodealliance/wasmtime.git vX.Y.Z");
         }
 
         "verify" => {
@@ -300,7 +309,10 @@ fn verify(crates: &[Crate]) {
             .arg("--manifest-path")
             .arg(&krate.manifest)
             .env("CARGO_TARGET_DIR", "./target");
-        if krate.name.contains("lightbeam") || krate.name == "witx" {
+        if krate.name.contains("lightbeam")
+            || krate.name == "witx"
+            || krate.name.contains("wasi-nn")
+        {
             cmd.arg("--no-verify");
         }
         let status = cmd.status().unwrap();

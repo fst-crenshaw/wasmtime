@@ -111,7 +111,7 @@
 use super::abi::*;
 use crate::binemit::StackMap;
 use crate::ir::types::*;
-use crate::ir::{ArgumentExtension, SourceLoc, StackSlot};
+use crate::ir::{ArgumentExtension, StackSlot};
 use crate::machinst::*;
 use crate::settings;
 use crate::CodegenResult;
@@ -119,6 +119,7 @@ use crate::{ir, isa};
 use alloc::vec::Vec;
 use log::{debug, trace};
 use regalloc::{RealReg, Reg, RegClass, Set, SpillSlot, Writable};
+use std::convert::TryFrom;
 use std::marker::PhantomData;
 use std::mem;
 
@@ -126,9 +127,24 @@ use std::mem;
 #[derive(Clone, Copy, Debug)]
 pub enum ABIArg {
     /// In a real register.
-    Reg(RealReg, ir::Type, ir::ArgumentExtension),
+    Reg(
+        RealReg,
+        ir::Type,
+        ir::ArgumentExtension,
+        ir::ArgumentPurpose,
+    ),
     /// Arguments only: on stack, at given offset from SP at entry.
-    Stack(i64, ir::Type, ir::ArgumentExtension),
+    Stack(i64, ir::Type, ir::ArgumentExtension, ir::ArgumentPurpose),
+}
+
+impl ABIArg {
+    /// Get the purpose of this arg.
+    fn get_purpose(self) -> ir::ArgumentPurpose {
+        match self {
+            ABIArg::Reg(_, _, _, purpose) => purpose,
+            ABIArg::Stack(_, _, _, purpose) => purpose,
+        }
+    }
 }
 
 /// Are we computing information about arguments or return values? Much of the
@@ -140,6 +156,16 @@ pub enum ArgsOrRets {
     Args,
     /// Return values.
     Rets,
+}
+
+/// Is an instruction returned by an ABI machine-specific backend a safepoint,
+/// or not?
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstIsSafepoint {
+    /// The instruction is a safepoint.
+    Yes,
+    /// The instruction is not a safepoint.
+    No,
 }
 
 /// Abstract location for a machine-specific ABI impl to translate into the
@@ -160,9 +186,38 @@ pub enum StackAMode {
 /// Trait implemented by machine-specific backend to provide information about
 /// register assignments and to allow generating the specific instructions for
 /// stack loads/saves, prologues/epilogues, etc.
-pub trait ABIMachineImpl {
+pub trait ABIMachineSpec {
     /// The instruction type.
     type I: VCodeInst;
+
+    /// Returns the number of bits in a word, that is 32/64 for 32/64-bit architecture.
+    fn word_bits() -> u32;
+
+    /// Returns the number of bytes in a word.
+    fn word_bytes() -> u32 {
+        return Self::word_bits() / 8;
+    }
+
+    /// Returns word-size integer type.
+    fn word_type() -> Type {
+        match Self::word_bits() {
+            32 => I32,
+            64 => I64,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Returns word register class.
+    fn word_reg_class() -> RegClass {
+        match Self::word_bits() {
+            32 => RegClass::I32,
+            64 => RegClass::I64,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Returns required stack alignment in bytes.
+    fn stack_align(call_conv: isa::CallConv) -> u32;
 
     /// Process a list of parameters or return values and allocate them to registers
     /// and stack slots.
@@ -207,13 +262,15 @@ pub trait ABIMachineImpl {
     fn gen_epilogue_placeholder() -> Self::I;
 
     /// Generate an add-with-immediate. Note that even if this uses a scratch
-    /// register, the sequence must still be correct if the given source or dest
-    /// is the register returned by `get_fixed_tmp_reg()`; hence, for machines
-    /// that may need a scratch register to synthesize an arbitrary constant,
-    /// the machine backend should reserve *another* fixed temp register for
-    /// this purpose. (E.g., on AArch64, x16 is the ordinary fixed tmp, and x17
-    /// is the secondary fixed tmp used to implement this.)
-    fn gen_add_imm(into_reg: Writable<Reg>, from_reg: Reg, imm: u64) -> SmallVec<[Self::I; 4]>;
+    /// register, it must satisfy two requirements:
+    ///
+    /// - The add-imm sequence must only clobber caller-save registers, because
+    ///   it will be placed in the prologue before the clobbered callee-save
+    ///   registers are saved.
+    ///
+    /// - The add-imm sequence must work correctly when `from_reg` and/or
+    ///   `into_reg` are the register returned by `get_stacklimit_reg()`.
+    fn gen_add_imm(into_reg: Writable<Reg>, from_reg: Reg, imm: u32) -> SmallVec<[Self::I; 4]>;
 
     /// Generate a sequence that traps with a `TrapCode::StackOverflow` code if
     /// the stack pointer is less than the given limit register (assuming the
@@ -224,21 +281,30 @@ pub trait ABIMachineImpl {
     /// SP-based offset).
     fn gen_get_stack_addr(mem: StackAMode, into_reg: Writable<Reg>, ty: Type) -> Self::I;
 
-    /// Get a fixed (not used by regalloc) temp. This is needed for certain
-    /// sequences generated after the register allocator has already run.
-    fn get_fixed_tmp_reg() -> Reg;
+    /// Get a fixed register to use to compute a stack limit. This is needed for
+    /// certain sequences generated after the register allocator has already
+    /// run. This must satisfy two requirements:
+    ///
+    /// - It must be a caller-save register, because it will be clobbered in the
+    ///   prologue before the clobbered callee-save registers are saved.
+    ///
+    /// - It must be safe to pass as an argument and/or destination to
+    ///   `gen_add_imm()`. This is relevant when an addition with a large
+    ///   immediate needs its own temporary; it cannot use the same fixed
+    ///   temporary as this one.
+    fn get_stacklimit_reg() -> Reg;
 
     /// Generate a store to the given [base+offset] address.
-    fn gen_load_base_offset(into_reg: Writable<Reg>, base: Reg, offset: i64, ty: Type) -> Self::I;
+    fn gen_load_base_offset(into_reg: Writable<Reg>, base: Reg, offset: i32, ty: Type) -> Self::I;
 
     /// Generate a load from the given [base+offset] address.
-    fn gen_store_base_offset(base: Reg, offset: i64, from_reg: Reg, ty: Type) -> Self::I;
+    fn gen_store_base_offset(base: Reg, offset: i32, from_reg: Reg, ty: Type) -> Self::I;
 
     /// Adjust the stack pointer up or down.
-    fn gen_sp_reg_adjust(amount: i64) -> SmallVec<[Self::I; 2]>;
+    fn gen_sp_reg_adjust(amount: i32) -> SmallVec<[Self::I; 2]>;
 
     /// Generate a meta-instruction that adjusts the nominal SP offset.
-    fn gen_nominal_sp_adj(amount: i64) -> Self::I;
+    fn gen_nominal_sp_adj(amount: i32) -> Self::I;
 
     /// Generate the usual frame-setup sequence for this architecture: e.g.,
     /// `push rbp / mov rbp, rsp` on x86-64, or `stp fp, lr, [sp, #-16]!` on
@@ -260,7 +326,10 @@ pub trait ABIMachineImpl {
     /// nominal SP offset; caller will do that.
     fn gen_clobber_save(
         call_conv: isa::CallConv,
+        flags: &settings::Flags,
         clobbers: &Set<Writable<RealReg>>,
+        fixed_frame_storage_size: u32,
+        outgoing_args_size: u32,
     ) -> (u64, SmallVec<[Self::I; 16]>);
 
     /// Generate a clobber-restore sequence. This sequence should perform the
@@ -269,21 +338,27 @@ pub trait ABIMachineImpl {
     /// clobber-save sequence finished.
     fn gen_clobber_restore(
         call_conv: isa::CallConv,
+        flags: &settings::Flags,
         clobbers: &Set<Writable<RealReg>>,
+        fixed_frame_storage_size: u32,
+        outgoing_args_size: u32,
     ) -> SmallVec<[Self::I; 16]>;
 
-    /// Generate a call instruction/sequence.
+    /// Generate a call instruction/sequence. This method is provided one
+    /// temporary register to use to synthesize the called address, if needed.
     fn gen_call(
         dest: &CallDest,
         uses: Vec<Reg>,
         defs: Vec<Writable<Reg>>,
-        loc: SourceLoc,
         opcode: ir::Opcode,
-    ) -> SmallVec<[(/* is_safepoint = */ bool, Self::I); 2]>;
+        tmp: Writable<Reg>,
+        callee_conv: isa::CallConv,
+        callee_conv: isa::CallConv,
+    ) -> SmallVec<[(InstIsSafepoint, Self::I); 2]>;
 
     /// Get the number of spillslots required for the given register-class and
     /// type.
-    fn get_spillslot_size(rc: RegClass, ty: Type) -> u32;
+    fn get_number_of_spillslots_for_value(rc: RegClass, ty: Type) -> u32;
 
     /// Get the current virtual-SP offset from an instruction-emission state.
     fn get_virtual_sp_offset_from_state(s: &<Self::I as MachInstEmit>::State) -> i64;
@@ -291,8 +366,19 @@ pub trait ABIMachineImpl {
     /// Get the "nominal SP to FP" offset from an instruction-emission state.
     fn get_nominal_sp_to_fp(s: &<Self::I as MachInstEmit>::State) -> i64;
 
-    /// Get all caller-save registers.
-    fn get_caller_saves(call_conv: isa::CallConv) -> Vec<Writable<Reg>>;
+    /// Get all caller-save registers, that is, registers that we expect
+    /// not to be saved across a call to a callee with the given ABI.
+    fn get_regs_clobbered_by_call(call_conv_of_callee: isa::CallConv) -> Vec<Writable<Reg>>;
+
+    /// Get the needed extension mode, given the mode attached to the argument
+    /// in the signature and the calling convention. The input (the attribute in
+    /// the signature) specifies what extension type should be done *if* the ABI
+    /// requires extension to the full register; this method's return value
+    /// indicates whether the extension actually *will* be done.
+    fn get_ext_mode(
+        call_conv: isa::CallConv,
+        specified: ir::ArgumentExtension,
+    ) -> ir::ArgumentExtension;
 }
 
 /// ABI information shared between body (callee) and caller.
@@ -314,7 +400,7 @@ struct ABISig {
 }
 
 impl ABISig {
-    fn from_func_sig<M: ABIMachineImpl>(sig: &ir::Signature) -> CodegenResult<ABISig> {
+    fn from_func_sig<M: ABIMachineSpec>(sig: &ir::Signature) -> CodegenResult<ABISig> {
         // Compute args and retvals from signature. Handle retvals first,
         // because we may need to add a return-area arg to the args.
         let (rets, stack_ret_space, _) = M::compute_arg_locs(
@@ -353,17 +439,23 @@ impl ABISig {
 }
 
 /// ABI object for a function body.
-pub struct ABIBodyImpl<M: ABIMachineImpl> {
+pub struct ABICalleeImpl<M: ABIMachineSpec> {
     /// Signature: arg and retval regs.
     sig: ABISig,
     /// Offsets to each stackslot.
     stackslots: Vec<u32>,
     /// Total stack size of all stackslots.
     stackslots_size: u32,
+    /// Stack size to be reserved for outgoing arguments.
+    outgoing_args_size: u32,
     /// Clobbered registers, from regalloc.
     clobbered: Set<Writable<RealReg>>,
     /// Total number of spillslots, from regalloc.
     spillslots: Option<usize>,
+    /// Storage allocated for the fixed part of the stack frame.  This is
+    /// usually the same as the total frame size below, except in the case
+    /// of the baldrdash calling convention.
+    fixed_frame_storage_size: u32,
     /// "Total frame size", as defined by "distance between FP and nominal SP".
     /// Some items are pushed below nominal SP, so the function may actually use
     /// more stack than this would otherwise imply. It is simply the initial
@@ -405,7 +497,7 @@ fn get_special_purpose_param_register(
     }
 }
 
-impl<M: ABIMachineImpl> ABIBodyImpl<M> {
+impl<M: ABIMachineSpec> ABICalleeImpl<M> {
     /// Create a new body ABI instance.
     pub fn new(f: &ir::Function, flags: settings::Flags) -> CodegenResult<Self> {
         debug!("ABI: func signature {:?}", f.signature);
@@ -429,7 +521,8 @@ impl<M: ABIMachineImpl> ABIBodyImpl<M> {
         for (stackslot, data) in f.stack_slots.iter() {
             let off = stack_offset;
             stack_offset += data.size;
-            stack_offset = (stack_offset + 7) & !7;
+            let mask = M::word_bytes() - 1;
+            stack_offset = (stack_offset + mask) & !mask;
             debug_assert_eq!(stackslot.as_u32() as usize, stackslots.len());
             stackslots.push(off);
         }
@@ -447,8 +540,10 @@ impl<M: ABIMachineImpl> ABIBodyImpl<M> {
             sig,
             stackslots,
             stackslots_size: stack_offset,
+            outgoing_args_size: 0,
             clobbered: Set::empty(),
             spillslots: None,
+            fixed_frame_storage_size: 0,
             total_frame_size: None,
             ret_area_ptr: None,
             call_conv,
@@ -506,8 +601,7 @@ impl<M: ABIMachineImpl> ABIBodyImpl<M> {
         // `scratch`. If our stack size doesn't fit into an immediate this
         // means we need a second scratch register for loading the stack size
         // into a register.
-        let scratch = Writable::from_reg(M::get_fixed_tmp_reg());
-        let stack_size = u64::from(stack_size);
+        let scratch = Writable::from_reg(M::get_stacklimit_reg());
         insts.extend(M::gen_add_imm(scratch, stack_limit, stack_size).into_iter());
         insts.extend(M::gen_stack_lower_bound_trap(scratch.to_reg()));
     }
@@ -532,7 +626,7 @@ impl<M: ABIMachineImpl> ABIBodyImpl<M> {
 /// temporary register to store values in if necessary. Currently after we write
 /// to this register there's guaranteed to be no spilled values between where
 /// it's used, because we're not participating in register allocation anyway!
-fn gen_stack_limit<M: ABIMachineImpl>(
+fn gen_stack_limit<M: ABIMachineSpec>(
     f: &ir::Function,
     abi: &ABISig,
     gv: ir::GlobalValue,
@@ -542,7 +636,7 @@ fn gen_stack_limit<M: ABIMachineImpl>(
     return (reg, insts);
 }
 
-fn generate_gv<M: ABIMachineImpl>(
+fn generate_gv<M: ABIMachineSpec>(
     f: &ir::Function,
     abi: &ABISig,
     gv: ir::GlobalValue,
@@ -563,8 +657,13 @@ fn generate_gv<M: ABIMachineImpl>(
             readonly: _,
         } => {
             let base = generate_gv::<M>(f, abi, base, insts);
-            let into_reg = Writable::from_reg(M::get_fixed_tmp_reg());
-            insts.push(M::gen_load_base_offset(into_reg, base, offset.into(), I64));
+            let into_reg = Writable::from_reg(M::get_stacklimit_reg());
+            insts.push(M::gen_load_base_offset(
+                into_reg,
+                base,
+                offset.into(),
+                M::word_type(),
+            ));
             return into_reg.to_reg();
         }
         ref other => panic!("global value for stack limit not supported: {}", other),
@@ -580,18 +679,18 @@ fn generate_gv<M: ABIMachineImpl>(
 /// associated vreg when needed to satisfy a safepoint (which requires all
 /// ref-typed values, even those in real registers in the original vcode, to be
 /// in spillslots).
-fn ty_from_ty_hint_or_reg_class(r: Reg, ty: Option<Type>) -> Type {
+fn ty_from_ty_hint_or_reg_class<M: ABIMachineSpec>(r: Reg, ty: Option<Type>) -> Type {
     match (ty, r.get_class()) {
         // If the type is provided
         (Some(t), _) => t,
         // If no type is provided, this should be a register spill for a
-        // safepoint, so we only expect I64 (integer) registers.
-        (None, RegClass::I64) => I64,
+        // safepoint, so we only expect I32/I64 (integer) registers.
+        (None, rc) if rc == M::word_reg_class() => M::word_type(),
         _ => panic!("Unexpected register class!"),
     }
 }
 
-impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
+impl<M: ABIMachineSpec> ABICallee for ABICalleeImpl<M> {
     type I = M::I;
 
     fn temp_needed(&self) -> bool {
@@ -605,8 +704,18 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         }
     }
 
+    fn accumulate_outgoing_args_size(&mut self, size: u32) {
+        if size > self.outgoing_args_size {
+            self.outgoing_args_size = size;
+        }
+    }
+
     fn flags(&self) -> &settings::Flags {
         &self.flags
+    }
+
+    fn call_conv(&self) -> isa::CallConv {
+        self.sig.call_conv
     }
 
     fn liveins(&self) -> Set<RealReg> {
@@ -645,8 +754,8 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         match &self.sig.args[idx] {
             // Extension mode doesn't matter (we're copying out, not in; we
             // ignore high bits by convention).
-            &ABIArg::Reg(r, ty, _) => M::gen_move(into_reg, r.to_reg(), ty),
-            &ABIArg::Stack(off, ty, _) => M::gen_load_stack(
+            &ABIArg::Reg(r, ty, ..) => M::gen_move(into_reg, r.to_reg(), ty),
+            &ABIArg::Stack(off, ty, ..) => M::gen_load_stack(
                 StackAMode::FPOffset(M::fp_to_arg_offset(self.call_conv, &self.flags) + off, ty),
                 into_reg,
                 ty,
@@ -654,42 +763,64 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         }
     }
 
+    fn arg_is_needed_in_body(&self, idx: usize) -> bool {
+        match self.sig.args[idx].get_purpose() {
+            // Special Baldrdash-specific pseudo-args that are present only to
+            // fill stack slots.  Won't ever be used as ordinary values in the
+            // body.
+            ir::ArgumentPurpose::CalleeTLS | ir::ArgumentPurpose::CallerTLS => false,
+            _ => true,
+        }
+    }
+
     fn gen_copy_reg_to_retval(&self, idx: usize, from_reg: Writable<Reg>) -> Vec<Self::I> {
         let mut ret = Vec::new();
+        let word_bits = M::word_bits() as u8;
         match &self.sig.rets[idx] {
-            &ABIArg::Reg(r, ty, ext) => {
+            &ABIArg::Reg(r, ty, ext, ..) => {
                 let from_bits = ty_bits(ty) as u8;
                 let dest_reg = Writable::from_reg(r.to_reg());
+                let ext = M::get_ext_mode(self.sig.call_conv, ext);
                 match (ext, from_bits) {
-                    (ArgumentExtension::Uext, n) | (ArgumentExtension::Sext, n) if n < 64 => {
+                    (ArgumentExtension::Uext, n) | (ArgumentExtension::Sext, n)
+                        if n < word_bits =>
+                    {
                         let signed = ext == ArgumentExtension::Sext;
                         ret.push(M::gen_extend(
                             dest_reg,
                             from_reg.to_reg(),
                             signed,
                             from_bits,
-                            /* to_bits = */ 64,
+                            /* to_bits = */ word_bits,
                         ));
                     }
                     _ => ret.push(M::gen_move(dest_reg, from_reg.to_reg(), ty)),
                 };
             }
-            &ABIArg::Stack(off, mut ty, ext) => {
+            &ABIArg::Stack(off, mut ty, ext, ..) => {
                 let from_bits = ty_bits(ty) as u8;
+                // A machine ABI implementation should ensure that stack frames
+                // have "reasonable" size. All current ABIs for machinst
+                // backends (aarch64 and x64) enforce a 128MB limit.
+                let off = i32::try_from(off)
+                    .expect("Argument stack offset greater than 2GB; should hit impl limit first");
+                let ext = M::get_ext_mode(self.sig.call_conv, ext);
                 // Trash the from_reg; it should be its last use.
                 match (ext, from_bits) {
-                    (ArgumentExtension::Uext, n) | (ArgumentExtension::Sext, n) if n < 64 => {
-                        assert_eq!(RegClass::I64, from_reg.to_reg().get_class());
+                    (ArgumentExtension::Uext, n) | (ArgumentExtension::Sext, n)
+                        if n < word_bits =>
+                    {
+                        assert_eq!(M::word_reg_class(), from_reg.to_reg().get_class());
                         let signed = ext == ArgumentExtension::Sext;
                         ret.push(M::gen_extend(
                             from_reg,
                             from_reg.to_reg(),
                             signed,
                             from_bits,
-                            /* to_bits = */ 64,
+                            /* to_bits = */ word_bits,
                         ));
                         // Store the extended version.
-                        ty = I64;
+                        ty = M::word_type();
                     }
                     _ => {}
                 };
@@ -774,7 +905,7 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
     fn load_spillslot(&self, slot: SpillSlot, ty: Type, into_reg: Writable<Reg>) -> Self::I {
         // Offset from beginning of spillslot area, which is at nominal SP + stackslots_size.
         let islot = slot.get() as i64;
-        let spill_off = islot * 8; // FIXME: 64-bit machine assumed.
+        let spill_off = islot * M::word_bytes() as i64;
         let sp_off = self.stackslots_size as i64 + spill_off;
         trace!("load_spillslot: slot {:?} -> sp_off {}", slot, sp_off);
         M::gen_load_stack(StackAMode::NominalSPOffset(sp_off, ty), into_reg, ty)
@@ -784,7 +915,7 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
     fn store_spillslot(&self, slot: SpillSlot, ty: Type, from_reg: Reg) -> Self::I {
         // Offset from beginning of spillslot area, which is at nominal SP + stackslots_size.
         let islot = slot.get() as i64;
-        let spill_off = islot * 8; // FIXME: 64-bit machine assumed.
+        let spill_off = islot * M::word_bytes() as i64;
         let sp_off = self.stackslots_size as i64 + spill_off;
         trace!("store_spillslot: slot {:?} -> sp_off {}", slot, sp_off);
         M::gen_store_stack(StackAMode::NominalSPOffset(sp_off, ty), from_reg, ty)
@@ -804,12 +935,14 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
             state
         );
         let map_size = (virtual_sp_offset + nominal_sp_to_fp) as u32;
-        let map_words = (map_size + 7) / 8; // FIXME: 64-bit machine assumed.
+        let bytes = M::word_bytes();
+        let map_words = (map_size + bytes - 1) / bytes;
         let mut bits = std::iter::repeat(false)
             .take(map_words as usize)
             .collect::<Vec<bool>>();
 
-        let first_spillslot_word = ((self.stackslots_size + virtual_sp_offset as u32) / 8) as usize;
+        let first_spillslot_word =
+            ((self.stackslots_size + virtual_sp_offset as u32) / bytes) as usize;
         for &slot in slots {
             let slot = slot.get() as usize;
             bits[first_spillslot_word + slot] = true;
@@ -825,18 +958,17 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
             insts.extend(M::gen_prologue_frame_setup().into_iter());
         }
 
-        let mut total_stacksize = self.stackslots_size + 8 * self.spillslots.unwrap() as u32;
+        let bytes = M::word_bytes();
+        let mut total_stacksize = self.stackslots_size + bytes * self.spillslots.unwrap() as u32;
         if self.call_conv.extends_baldrdash() {
             debug_assert!(
                 !self.flags.enable_probestack(),
                 "baldrdash does not expect cranelift to emit stack probes"
             );
-            // FIXME: 64-bit machine assumed.
-            total_stacksize += self.flags.baldrdash_prologue_words() as u32 * 8;
+            total_stacksize += self.flags.baldrdash_prologue_words() as u32 * bytes;
         }
-        let total_stacksize = (total_stacksize + 15) & !15; // 16-align the stack.
-
-        let mut total_sp_adjust = 0;
+        let mask = M::stack_align(self.call_conv) - 1;
+        let total_stacksize = (total_stacksize + mask) & !mask; // 16-align the stack.
 
         if !self.call_conv.extends_baldrdash() {
             // Leaf functions with zero stack don't need a stack check if one's
@@ -848,7 +980,7 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
                 }
             }
             if total_stacksize > 0 {
-                total_sp_adjust += total_stacksize as u64;
+                self.fixed_frame_storage_size += total_stacksize;
             }
         }
 
@@ -862,18 +994,19 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         // [crate::machinst::abi_impl](this module) for more details on
         // stackframe layout and nominal SP maintenance.
 
-        if total_sp_adjust > 0 {
-            // sub sp, sp, #total_stacksize
-            let adj = total_sp_adjust as i64;
-            insts.extend(M::gen_sp_reg_adjust(-adj));
-        }
-
         // Save clobbered registers.
-        let (clobber_size, clobber_insts) = M::gen_clobber_save(self.call_conv, &self.clobbered);
+        let (clobber_size, clobber_insts) = M::gen_clobber_save(
+            self.call_conv,
+            &self.flags,
+            &self.clobbered,
+            self.fixed_frame_storage_size,
+            self.outgoing_args_size,
+        );
         insts.extend(clobber_insts);
 
-        if clobber_size > 0 {
-            insts.push(M::gen_nominal_sp_adj(clobber_size as i64));
+        let sp_adj = self.outgoing_args_size as i32 + clobber_size as i32;
+        if sp_adj > 0 {
+            insts.push(M::gen_nominal_sp_adj(sp_adj));
         }
 
         self.total_frame_size = Some(total_stacksize);
@@ -884,7 +1017,13 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         let mut insts = vec![];
 
         // Restore clobbered registers.
-        insts.extend(M::gen_clobber_restore(self.call_conv, &self.clobbered));
+        insts.extend(M::gen_clobber_restore(
+            self.call_conv,
+            &self.flags,
+            &self.clobbered,
+            self.fixed_frame_storage_size,
+            self.outgoing_args_size,
+        ));
 
         // N.B.: we do *not* emit a nominal SP adjustment here, because (i) there will be no
         // references to nominal SP offsets before the return below, and (ii) the instruction
@@ -911,11 +1050,11 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
     }
 
     fn get_spillslot_size(&self, rc: RegClass, ty: Type) -> u32 {
-        M::get_spillslot_size(rc, ty)
+        M::get_number_of_spillslots_for_value(rc, ty)
     }
 
     fn gen_spill(&self, to_slot: SpillSlot, from_reg: RealReg, ty: Option<Type>) -> Self::I {
-        let ty = ty_from_ty_hint_or_reg_class(from_reg.to_reg(), ty);
+        let ty = ty_from_ty_hint_or_reg_class::<M>(from_reg.to_reg(), ty);
         self.store_spillslot(to_slot, ty, from_reg.to_reg())
     }
 
@@ -925,12 +1064,24 @@ impl<M: ABIMachineImpl> ABIBody for ABIBodyImpl<M> {
         from_slot: SpillSlot,
         ty: Option<Type>,
     ) -> Self::I {
-        let ty = ty_from_ty_hint_or_reg_class(to_reg.to_reg().to_reg(), ty);
+        let ty = ty_from_ty_hint_or_reg_class::<M>(to_reg.to_reg().to_reg(), ty);
         self.load_spillslot(from_slot, ty, to_reg.map(|r| r.to_reg()))
+    }
+
+    fn unwind_info_kind(&self) -> UnwindInfoKind {
+        match self.sig.call_conv {
+            #[cfg(feature = "unwind")]
+            isa::CallConv::Fast | isa::CallConv::Cold | isa::CallConv::SystemV => {
+                UnwindInfoKind::SystemV
+            }
+            #[cfg(feature = "unwind")]
+            isa::CallConv::WindowsFastcall => UnwindInfoKind::Windows,
+            _ => UnwindInfoKind::None,
+        }
     }
 }
 
-fn abisig_to_uses_and_defs<M: ABIMachineImpl>(sig: &ABISig) -> (Vec<Reg>, Vec<Writable<Reg>>) {
+fn abisig_to_uses_and_defs<M: ABIMachineSpec>(sig: &ABISig) -> (Vec<Reg>, Vec<Writable<Reg>>) {
     // Compute uses: all arg regs.
     let mut uses = Vec::new();
     for arg in &sig.args {
@@ -941,7 +1092,7 @@ fn abisig_to_uses_and_defs<M: ABIMachineImpl>(sig: &ABISig) -> (Vec<Reg>, Vec<Wr
     }
 
     // Compute defs: all retval regs, and all caller-save (clobbered) regs.
-    let mut defs = M::get_caller_saves(sig.call_conv);
+    let mut defs = M::get_regs_clobbered_by_call(sig.call_conv);
     for ret in &sig.rets {
         match ret {
             &ABIArg::Reg(reg, ..) => defs.push(Writable::from_reg(reg.to_reg())),
@@ -953,7 +1104,7 @@ fn abisig_to_uses_and_defs<M: ABIMachineImpl>(sig: &ABISig) -> (Vec<Reg>, Vec<Wr
 }
 
 /// ABI object for a callsite.
-pub struct ABICallImpl<M: ABIMachineImpl> {
+pub struct ABICallerImpl<M: ABIMachineSpec> {
     /// The called function's signature.
     sig: ABISig,
     /// All uses for the callsite, i.e., function args.
@@ -962,10 +1113,10 @@ pub struct ABICallImpl<M: ABIMachineImpl> {
     defs: Vec<Writable<Reg>>,
     /// Call destination.
     dest: CallDest,
-    /// Location of callsite.
-    loc: ir::SourceLoc,
-    /// Actuall call opcode; used to distinguish various types of calls.
+    /// Actual call opcode; used to distinguish various types of calls.
     opcode: ir::Opcode,
+    /// Caller's calling convention.
+    caller_conv: isa::CallConv,
 
     _mach: PhantomData<M>,
 }
@@ -979,23 +1130,23 @@ pub enum CallDest {
     Reg(Reg),
 }
 
-impl<M: ABIMachineImpl> ABICallImpl<M> {
+impl<M: ABIMachineSpec> ABICallerImpl<M> {
     /// Create a callsite ABI object for a call directly to the specified function.
     pub fn from_func(
         sig: &ir::Signature,
         extname: &ir::ExternalName,
         dist: RelocDistance,
-        loc: ir::SourceLoc,
-    ) -> CodegenResult<ABICallImpl<M>> {
+        caller_conv: isa::CallConv,
+    ) -> CodegenResult<ABICallerImpl<M>> {
         let sig = ABISig::from_func_sig::<M>(sig)?;
         let (uses, defs) = abisig_to_uses_and_defs::<M>(&sig);
-        Ok(ABICallImpl {
+        Ok(ABICallerImpl {
             sig,
             uses,
             defs,
             dest: CallDest::ExtName(extname.clone(), dist),
-            loc,
             opcode: ir::Opcode::Call,
+            caller_conv,
             _mach: PhantomData,
         })
     }
@@ -1005,32 +1156,31 @@ impl<M: ABIMachineImpl> ABICallImpl<M> {
     pub fn from_ptr(
         sig: &ir::Signature,
         ptr: Reg,
-        loc: ir::SourceLoc,
         opcode: ir::Opcode,
-    ) -> CodegenResult<ABICallImpl<M>> {
+        caller_conv: isa::CallConv,
+    ) -> CodegenResult<ABICallerImpl<M>> {
         let sig = ABISig::from_func_sig::<M>(sig)?;
         let (uses, defs) = abisig_to_uses_and_defs::<M>(&sig);
-        Ok(ABICallImpl {
+        Ok(ABICallerImpl {
             sig,
             uses,
             defs,
             dest: CallDest::Reg(ptr),
-            loc,
             opcode,
+            caller_conv,
             _mach: PhantomData,
         })
     }
 }
 
-fn adjust_stack_and_nominal_sp<M: ABIMachineImpl, C: LowerCtx<I = M::I>>(
+fn adjust_stack_and_nominal_sp<M: ABIMachineSpec, C: LowerCtx<I = M::I>>(
     ctx: &mut C,
-    off: u64,
+    off: i32,
     is_sub: bool,
 ) {
     if off == 0 {
         return;
     }
-    let off = off as i64;
     let amt = if is_sub { -off } else { off };
     for inst in M::gen_sp_reg_adjust(amt) {
         ctx.emit(inst);
@@ -1038,7 +1188,7 @@ fn adjust_stack_and_nominal_sp<M: ABIMachineImpl, C: LowerCtx<I = M::I>>(
     ctx.emit(M::gen_nominal_sp_adj(-amt));
 }
 
-impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
+impl<M: ABIMachineSpec> ABICaller for ABICallerImpl<M> {
     type I = M::I;
 
     fn num_args(&self) -> usize {
@@ -1049,14 +1199,19 @@ impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
         }
     }
 
+    fn accumulate_outgoing_args_size<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
+        let off = self.sig.stack_arg_space + self.sig.stack_ret_space;
+        ctx.abi().accumulate_outgoing_args_size(off as u32);
+    }
+
     fn emit_stack_pre_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
         let off = self.sig.stack_arg_space + self.sig.stack_ret_space;
-        adjust_stack_and_nominal_sp::<M, C>(ctx, off as u64, /* is_sub = */ true)
+        adjust_stack_and_nominal_sp::<M, C>(ctx, off as i32, /* is_sub = */ true)
     }
 
     fn emit_stack_post_adjust<C: LowerCtx<I = Self::I>>(&self, ctx: &mut C) {
         let off = self.sig.stack_arg_space + self.sig.stack_ret_space;
-        adjust_stack_and_nominal_sp::<M, C>(ctx, off as u64, /* is_sub = */ false)
+        adjust_stack_and_nominal_sp::<M, C>(ctx, off as i32, /* is_sub = */ false)
     }
 
     fn emit_copy_reg_to_arg<C: LowerCtx<I = Self::I>>(
@@ -1065,30 +1220,33 @@ impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
         idx: usize,
         from_reg: Reg,
     ) {
+        let word_rc = M::word_reg_class();
+        let word_bits = M::word_bits() as usize;
         match &self.sig.args[idx] {
-            &ABIArg::Reg(reg, ty, ext)
-                if ext != ir::ArgumentExtension::None && ty_bits(ty) < 64 =>
-            {
-                assert_eq!(RegClass::I64, reg.get_class());
-                let signed = match ext {
-                    ir::ArgumentExtension::Uext => false,
-                    ir::ArgumentExtension::Sext => true,
-                    _ => unreachable!(),
-                };
-                ctx.emit(M::gen_extend(
-                    Writable::from_reg(reg.to_reg()),
-                    from_reg,
-                    signed,
-                    ty_bits(ty) as u8,
-                    64,
-                ));
+            &ABIArg::Reg(reg, ty, ext, _) => {
+                let ext = M::get_ext_mode(self.sig.call_conv, ext);
+                if ext != ir::ArgumentExtension::None && ty_bits(ty) < word_bits {
+                    assert_eq!(word_rc, reg.get_class());
+                    let signed = match ext {
+                        ir::ArgumentExtension::Uext => false,
+                        ir::ArgumentExtension::Sext => true,
+                        _ => unreachable!(),
+                    };
+                    ctx.emit(M::gen_extend(
+                        Writable::from_reg(reg.to_reg()),
+                        from_reg,
+                        signed,
+                        ty_bits(ty) as u8,
+                        word_bits as u8,
+                    ));
+                } else {
+                    ctx.emit(M::gen_move(Writable::from_reg(reg.to_reg()), from_reg, ty));
+                }
             }
-            &ABIArg::Reg(reg, ty, _) => {
-                ctx.emit(M::gen_move(Writable::from_reg(reg.to_reg()), from_reg, ty));
-            }
-            &ABIArg::Stack(off, mut ty, ext) => {
-                if ext != ir::ArgumentExtension::None && ty_bits(ty) < 64 {
-                    assert_eq!(RegClass::I64, from_reg.get_class());
+            &ABIArg::Stack(off, mut ty, ext, _) => {
+                let ext = M::get_ext_mode(self.sig.call_conv, ext);
+                if ext != ir::ArgumentExtension::None && ty_bits(ty) < word_bits {
+                    assert_eq!(word_rc, from_reg.get_class());
                     let signed = match ext {
                         ir::ArgumentExtension::Uext => false,
                         ir::ArgumentExtension::Sext => true,
@@ -1102,10 +1260,10 @@ impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
                         from_reg,
                         signed,
                         ty_bits(ty) as u8,
-                        64,
+                        word_bits as u8,
                     ));
                     // Store the extended version.
-                    ty = I64;
+                    ty = M::word_type();
                 }
                 ctx.emit(M::gen_store_stack(
                     StackAMode::SPOffset(off, ty),
@@ -1125,8 +1283,8 @@ impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
         match &self.sig.rets[idx] {
             // Extension mode doesn't matter because we're copying out, not in,
             // and we ignore high bits in our own registers by convention.
-            &ABIArg::Reg(reg, ty, _) => ctx.emit(M::gen_move(into_reg, reg.to_reg(), ty)),
-            &ABIArg::Stack(off, ty, _) => {
+            &ABIArg::Reg(reg, ty, _, _) => ctx.emit(M::gen_move(into_reg, reg.to_reg(), ty)),
+            &ABIArg::Stack(off, ty, _, _) => {
                 let ret_area_base = self.sig.stack_arg_space;
                 ctx.emit(M::gen_load_stack(
                     StackAMode::SPOffset(off + ret_area_base, ty),
@@ -1142,8 +1300,10 @@ impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
             mem::replace(&mut self.uses, Default::default()),
             mem::replace(&mut self.defs, Default::default()),
         );
+        let word_rc = M::word_reg_class();
+        let word_type = M::word_type();
         if let Some(i) = self.sig.stack_ret_arg {
-            let rd = ctx.alloc_tmp(RegClass::I64, I64);
+            let rd = ctx.alloc_tmp(word_rc, word_type);
             let ret_area_base = self.sig.stack_arg_space;
             ctx.emit(M::gen_get_stack_addr(
                 StackAMode::SPOffset(ret_area_base, I8),
@@ -1152,13 +1312,21 @@ impl<M: ABIMachineImpl> ABICall for ABICallImpl<M> {
             ));
             self.emit_copy_reg_to_arg(ctx, i, rd.to_reg());
         }
-        for (is_safepoint, inst) in
-            M::gen_call(&self.dest, uses, defs, self.loc, self.opcode).into_iter()
+        let tmp = ctx.alloc_tmp(word_rc, word_type);
+        for (is_safepoint, inst) in M::gen_call(
+            &self.dest,
+            uses,
+            defs,
+            self.opcode,
+            tmp,
+            self.sig.call_conv,
+            self.caller_conv,
+        )
+        .into_iter()
         {
-            if is_safepoint {
-                ctx.emit_safepoint(inst);
-            } else {
-                ctx.emit(inst);
+            match is_safepoint {
+                InstIsSafepoint::Yes => ctx.emit_safepoint(inst),
+                InstIsSafepoint::No => ctx.emit(inst),
             }
         }
     }

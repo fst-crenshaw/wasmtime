@@ -14,9 +14,8 @@
         clippy::float_arithmetic,
         clippy::mut_mut,
         clippy::nonminimal_bool,
-        clippy::option_map_unwrap_or,
-        clippy::option_map_unwrap_or_else,
-        clippy::unicode_not_nfc,
+        clippy::map_unwrap_or,
+        clippy::clippy::unicode_not_nfc,
         clippy::use_self
     )
 )]
@@ -29,8 +28,8 @@ pub mod fs;
 mod handle;
 pub mod old;
 mod path;
-mod poll;
 mod sandboxed_tty_writer;
+pub(crate) mod sched;
 pub mod snapshots;
 mod string_array;
 mod sys;

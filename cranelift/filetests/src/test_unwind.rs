@@ -3,7 +3,7 @@
 //! The `unwind` test command runs each function through the full code generator pipeline.
 #![cfg_attr(feature = "cargo-clippy", allow(clippy::cast_ptr_alignment))]
 
-use crate::subtest::{run_filecheck, Context, SubTest, SubtestResult};
+use crate::subtest::{run_filecheck, Context, SubTest};
 use cranelift_codegen::{self, ir, isa::unwind::UnwindInfo};
 use cranelift_reader::TestCommand;
 use gimli::{
@@ -14,13 +14,12 @@ use std::borrow::Cow;
 
 struct TestUnwind;
 
-pub fn subtest(parsed: &TestCommand) -> SubtestResult<Box<dyn SubTest>> {
+pub fn subtest(parsed: &TestCommand) -> anyhow::Result<Box<dyn SubTest>> {
     assert_eq!(parsed.command, "unwind");
     if !parsed.options.is_empty() {
-        Err(format!("No options allowed on {}", parsed))
-    } else {
-        Ok(Box::new(TestUnwind))
+        anyhow::bail!("No options allowed on {}", parsed);
     }
+    Ok(Box::new(TestUnwind))
 }
 
 impl SubTest for TestUnwind {
@@ -36,7 +35,7 @@ impl SubTest for TestUnwind {
         true
     }
 
-    fn run(&self, func: Cow<ir::Function>, context: &Context) -> SubtestResult<()> {
+    fn run(&self, func: Cow<ir::Function>, context: &Context) -> anyhow::Result<()> {
         let isa = context.isa.expect("unwind needs an ISA");
         let mut comp_ctx = cranelift_codegen::Context::for_function(func.into_owned());
 
@@ -61,6 +60,9 @@ impl SubTest for TestUnwind {
                 let mut eh_frame = EhFrame(EndianVec::new(LittleEndian));
                 table.write_eh_frame(&mut eh_frame).unwrap();
                 systemv::dump(&mut text, &eh_frame.0.into_vec(), isa.pointer_bytes())
+            }
+            Some(ui) => {
+                anyhow::bail!("Unexpected unwind info type: {:?}", ui);
             }
             None => {}
         }

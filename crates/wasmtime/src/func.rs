@@ -1,4 +1,4 @@
-use crate::runtime::StoreInner;
+use crate::store::StoreInner;
 use crate::trampoline::StoreInstanceHandle;
 use crate::{Extern, ExternRef, FuncType, Memory, Store, Trap, Val, ValType};
 use anyhow::{bail, ensure, Context as _, Result};
@@ -113,8 +113,8 @@ use wasmtime_runtime::{
 /// // Here we need to define the type signature of our `Double` function and
 /// // then wrap it up in a `Func`
 /// let double_type = wasmtime::FuncType::new(
-///     Box::new([wasmtime::ValType::I32]),
-///     Box::new([wasmtime::ValType::I32])
+///     [wasmtime::ValType::I32].iter().cloned(),
+///     [wasmtime::ValType::I32].iter().cloned(),
 /// );
 /// let double = Func::new(&store, double_type, |_, params, results| {
 ///     let mut value = params[0].unwrap_i32();
@@ -163,7 +163,7 @@ macro_rules! getters {
             // Verify all the paramers match the expected parameters, and that
             // there are no extra parameters...
             let ty = self.ty();
-            let mut params = ty.params().iter().cloned();
+            let mut params = ty.params();
             let n = 0;
             $(
                 let n = n + 1;
@@ -173,7 +173,7 @@ macro_rules! getters {
             ensure!(params.next().is_none(), "Type mismatch: too many arguments (expected {})", n);
 
             // ... then do the same for the results...
-            let mut results = ty.results().iter().cloned();
+            let mut results = ty.results();
             R::matches(&mut results)
                 .context("Type mismatch in return type")?;
             ensure!(results.next().is_none(), "Type mismatch: too many return values (expected 1)");
@@ -274,7 +274,7 @@ impl Func {
             let mut args: SmallVec<[Val; STACK_ARGS]> =
                 SmallVec::with_capacity(ty_clone.params().len());
             let store = Store::upgrade(&store_weak).unwrap();
-            for (i, ty) in ty_clone.params().iter().enumerate() {
+            for (i, ty) in ty_clone.params().enumerate() {
                 unsafe {
                     let val = Val::read_value_from(&store, values_vec.add(i), ty);
                     args.push(val);
@@ -295,12 +295,17 @@ impl Func {
 
             // Unlike our arguments we need to dynamically check that the return
             // values produced are correct. There could be a bug in `func` that
-            // produces the wrong number or wrong types of values, and we need
-            // to catch that here.
+            // produces the wrong number, wrong types, or wrong stores of
+            // values, and we need to catch that here.
             for (i, (ret, ty)) in returns.into_iter().zip(ty_clone.results()).enumerate() {
-                if ret.ty() != *ty {
+                if ret.ty() != ty {
                     return Err(Trap::new(
                         "function attempted to return an incompatible value",
+                    ));
+                }
+                if !ret.comes_from_same_store(&store) {
+                    return Err(Trap::new(
+                        "cross-`Store` values are not currently supported",
                     ));
                 }
                 unsafe {
@@ -540,7 +545,10 @@ impl Func {
     pub fn ty(&self) -> FuncType {
         // Signatures should always be registered in the store's registry of
         // shared signatures, so we should be able to unwrap safely here.
-        let wft = self.instance.store.lookup_signature(self.sig_index());
+        let signatures = self.instance.store.signatures().borrow();
+        let (wft, _) = signatures
+            .lookup_shared(self.sig_index())
+            .expect("signature should be registered");
 
         // This is only called with `Export::Function`, and since it's coming
         // from wasmtime_runtime itself we should support all the types coming
@@ -550,19 +558,19 @@ impl Func {
 
     /// Returns the number of parameters that this function takes.
     pub fn param_arity(&self) -> usize {
-        let sig = self
-            .instance
-            .store
-            .lookup_signature(unsafe { self.export.anyfunc.as_ref().type_index });
+        let signatures = self.instance.store.signatures().borrow();
+        let (sig, _) = signatures
+            .lookup_shared(self.sig_index())
+            .expect("signature should be registered");
         sig.params.len()
     }
 
     /// Returns the number of results this function produces.
     pub fn result_arity(&self) -> usize {
-        let sig = self
-            .instance
-            .store
-            .lookup_signature(unsafe { self.export.anyfunc.as_ref().type_index });
+        let signatures = self.instance.store.signatures().borrow();
+        let (sig, _) = signatures
+            .lookup_shared(self.sig_index())
+            .expect("signature should be registered");
         sig.returns.len()
     }
 
@@ -593,9 +601,9 @@ impl Func {
         let mut values_vec = vec![0; max(params.len(), my_ty.results().len())];
 
         // Store the argument values into `values_vec`.
-        let param_tys = my_ty.params().iter();
+        let param_tys = my_ty.params();
         for ((arg, slot), ty) in params.iter().cloned().zip(&mut values_vec).zip(param_tys) {
-            if arg.ty() != *ty {
+            if arg.ty() != ty {
                 bail!(
                     "argument type mismatch: found {} but expected {}",
                     arg.ty(),
@@ -625,7 +633,7 @@ impl Func {
 
         // Load the return values out of `values_vec`.
         let mut results = Vec::with_capacity(my_ty.results().len());
-        for (index, ty) in my_ty.results().iter().enumerate() {
+        for (index, ty) in my_ty.results().enumerate() {
             unsafe {
                 let ptr = values_vec.as_ptr().add(index);
                 results.push(Val::read_value_from(&self.instance.store, ptr, ty));
@@ -649,8 +657,12 @@ impl Func {
         // on that module as well, so unwrap the result here since otherwise
         // it's a bug in wasmtime.
         let trampoline = instance
-            .trampoline(unsafe { export.anyfunc.as_ref().type_index })
-            .expect("failed to retrieve trampoline from module");
+            .store
+            .signatures()
+            .borrow()
+            .lookup_shared(unsafe { export.anyfunc.as_ref().type_index })
+            .expect("failed to retrieve trampoline from module")
+            .1;
 
         Func {
             instance,
@@ -812,21 +824,14 @@ pub(crate) fn invoke_wasm_and_catch_traps(
     store: &Store,
     closure: impl FnMut(),
 ) -> Result<(), Trap> {
-    let signalhandler = store.signal_handler();
     unsafe {
         let canary = 0;
         let _auto_reset_canary = store
             .externref_activations_table()
             .set_stack_canary(&canary);
 
-        wasmtime_runtime::catch_traps(
-            vmctx,
-            store.engine().config().max_wasm_stack,
-            |addr| store.is_in_jit_code(addr),
-            signalhandler.as_deref(),
-            closure,
-        )
-        .map_err(Trap::from_runtime)
+        wasmtime_runtime::catch_traps(vmctx, store, closure)
+            .map_err(|e| Trap::from_runtime(store, e))
     }
 }
 
@@ -869,7 +874,7 @@ pub unsafe trait WasmTy {
 
     // Add this type to the given vec of expected valtypes.
     #[doc(hidden)]
-    fn push(dst: &mut Vec<ValType>);
+    fn valtype() -> Option<ValType>;
 
     // Does the next valtype(s) match this type?
     #[doc(hidden)]
@@ -916,7 +921,7 @@ pub unsafe trait WasmRet {
 
     // Same as `WasmTy::push`.
     #[doc(hidden)]
-    fn push(dst: &mut Vec<ValType>);
+    fn valtype() -> Option<ValType>;
 
     // Same as `WasmTy::matches`.
     #[doc(hidden)]
@@ -945,7 +950,9 @@ unsafe impl WasmTy for () {
     #[inline]
     unsafe fn from_abi<'a>(_abi: Self::Abi, _store: WeakStore<'a>) -> Self {}
 
-    fn push(_dst: &mut Vec<ValType>) {}
+    fn valtype() -> Option<ValType> {
+        None
+    }
 
     fn matches(_tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
         Ok(())
@@ -976,8 +983,8 @@ unsafe impl WasmTy for i32 {
         abi
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        dst.push(ValType::I32);
+    fn valtype() -> Option<ValType> {
+        Some(ValType::I32)
     }
 
     fn matches(mut tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -992,14 +999,14 @@ unsafe impl WasmTy for i32 {
 
     #[inline]
     unsafe fn load_from_args(ptr: &mut *const u128) -> Self::Abi {
-        let ret = **ptr as Self;
+        let ret = *(*ptr).cast::<Self>();
         *ptr = (*ptr).add(1);
         return ret;
     }
 
     #[inline]
     unsafe fn store_to_args(abi: Self::Abi, ptr: *mut u128) {
-        *ptr = abi as u128;
+        *ptr.cast::<Self>() = abi;
     }
 }
 
@@ -1021,8 +1028,8 @@ unsafe impl WasmTy for u32 {
         abi as Self
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        <i32 as WasmTy>::push(dst)
+    fn valtype() -> Option<ValType> {
+        <i32 as WasmTy>::valtype()
     }
 
     fn matches(tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1058,8 +1065,8 @@ unsafe impl WasmTy for i64 {
         abi
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        dst.push(ValType::I64);
+    fn valtype() -> Option<ValType> {
+        Some(ValType::I64)
     }
 
     fn matches(mut tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1074,14 +1081,14 @@ unsafe impl WasmTy for i64 {
 
     #[inline]
     unsafe fn load_from_args(ptr: &mut *const u128) -> Self::Abi {
-        let ret = **ptr as Self;
+        let ret = *(*ptr).cast::<Self>();
         *ptr = (*ptr).add(1);
         return ret;
     }
 
     #[inline]
     unsafe fn store_to_args(abi: Self::Abi, ptr: *mut u128) {
-        *ptr = abi as u128;
+        *ptr.cast::<Self>() = abi;
     }
 }
 
@@ -1103,8 +1110,8 @@ unsafe impl WasmTy for u64 {
         abi as Self
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        <i64 as WasmTy>::push(dst)
+    fn valtype() -> Option<ValType> {
+        <i64 as WasmTy>::valtype()
     }
 
     fn matches(tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1140,8 +1147,8 @@ unsafe impl WasmTy for f32 {
         abi
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        dst.push(ValType::F32);
+    fn valtype() -> Option<ValType> {
+        Some(ValType::F32)
     }
 
     fn matches(mut tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1156,14 +1163,14 @@ unsafe impl WasmTy for f32 {
 
     #[inline]
     unsafe fn load_from_args(ptr: &mut *const u128) -> Self::Abi {
-        let ret = f32::from_bits(**ptr as u32);
+        let ret = f32::from_bits(*(*ptr).cast::<u32>());
         *ptr = (*ptr).add(1);
         return ret;
     }
 
     #[inline]
     unsafe fn store_to_args(abi: Self::Abi, ptr: *mut u128) {
-        *ptr = abi.to_bits() as u128;
+        *ptr.cast::<u32>() = abi.to_bits();
     }
 }
 
@@ -1185,8 +1192,8 @@ unsafe impl WasmTy for f64 {
         abi
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        dst.push(ValType::F64);
+    fn valtype() -> Option<ValType> {
+        Some(ValType::F64)
     }
 
     fn matches(mut tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1201,14 +1208,14 @@ unsafe impl WasmTy for f64 {
 
     #[inline]
     unsafe fn load_from_args(ptr: &mut *const u128) -> Self::Abi {
-        let ret = f64::from_bits(**ptr as u64);
+        let ret = f64::from_bits(*(*ptr).cast::<u64>());
         *ptr = (*ptr).add(1);
         return ret;
     }
 
     #[inline]
     unsafe fn store_to_args(abi: Self::Abi, ptr: *mut u128) {
-        *ptr = abi.to_bits() as u128;
+        *ptr.cast::<u64>() = abi.to_bits();
     }
 }
 
@@ -1247,8 +1254,8 @@ unsafe impl WasmTy for Option<ExternRef> {
         }
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        dst.push(ValType::ExternRef);
+    fn valtype() -> Option<ValType> {
+        Some(ValType::ExternRef)
     }
 
     fn matches(mut tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1262,13 +1269,13 @@ unsafe impl WasmTy for Option<ExternRef> {
     }
 
     unsafe fn load_from_args(ptr: &mut *const u128) -> Self::Abi {
-        let ret = **ptr as usize as *mut u8;
+        let ret = *(*ptr).cast::<usize>() as *mut u8;
         *ptr = (*ptr).add(1);
         ret
     }
 
     unsafe fn store_to_args(abi: Self::Abi, ptr: *mut u128) {
-        ptr::write(ptr, abi as usize as u128);
+        ptr::write(ptr.cast::<usize>(), abi as usize);
     }
 }
 
@@ -1300,8 +1307,8 @@ unsafe impl WasmTy for Option<Func> {
         Func::from_caller_checked_anyfunc(&store, abi)
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        dst.push(ValType::FuncRef);
+    fn valtype() -> Option<ValType> {
+        Some(ValType::FuncRef)
     }
 
     fn matches(mut tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1315,13 +1322,13 @@ unsafe impl WasmTy for Option<Func> {
     }
 
     unsafe fn load_from_args(ptr: &mut *const u128) -> Self::Abi {
-        let ret = **ptr as usize as *mut wasmtime_runtime::VMCallerCheckedAnyfunc;
+        let ret = *(*ptr).cast::<usize>() as *mut wasmtime_runtime::VMCallerCheckedAnyfunc;
         *ptr = (*ptr).add(1);
         ret
     }
 
     unsafe fn store_to_args(abi: Self::Abi, ptr: *mut u128) {
-        ptr::write(ptr, abi as usize as u128);
+        ptr::write(ptr.cast::<usize>(), abi as usize);
     }
 }
 
@@ -1346,9 +1353,8 @@ where
         <Self as WasmTy>::from_abi(abi, store)
     }
 
-    #[inline]
-    fn push(dst: &mut Vec<ValType>) {
-        <Self as WasmTy>::push(dst)
+    fn valtype() -> Option<ValType> {
+        <Self as WasmTy>::valtype()
     }
 
     #[inline]
@@ -1398,8 +1404,8 @@ where
         Ok(<T as WasmTy>::from_abi(abi, store))
     }
 
-    fn push(dst: &mut Vec<ValType>) {
-        <T as WasmTy>::push(dst)
+    fn valtype() -> Option<ValType> {
+        <T as WasmTy>::valtype()
     }
 
     fn matches(tys: impl Iterator<Item = ValType>) -> anyhow::Result<()> {
@@ -1603,6 +1609,14 @@ macro_rules! impl_into_func {
                             )
                         }))
                     };
+
+                    // Note that we need to be careful when dealing with traps
+                    // here. Traps are implemented with longjmp/setjmp meaning
+                    // that it's not unwinding and consequently no Rust
+                    // destructors are run. We need to be careful to ensure that
+                    // nothing on the stack needs a destructor when we exit
+                    // abnormally from this `match`, e.g. on `Err`, on
+                    // cross-store-issues, or if `Ok(Err)` is raised.
                     match ret {
                         Err(panic) => wasmtime_runtime::resume_panic(panic),
                         Ok(ret) => {
@@ -1610,6 +1624,7 @@ macro_rules! impl_into_func {
                             // can't assume it returned a value that is
                             // compatible with this store.
                             if !ret.compatible_with_store(weak_store) {
+                                drop(ret);
                                 raise_cross_store_trap();
                             }
 
@@ -1650,11 +1665,12 @@ macro_rules! impl_into_func {
                     R::store_to_args(ret, args);
                 }
 
-                let mut _args = Vec::new();
-                $($args::push(&mut _args);)*
-                let mut ret = Vec::new();
-                R::push(&mut ret);
-                let ty = FuncType::new(_args.into(), ret.into());
+                let ty = FuncType::new(
+                    None::<ValType>.into_iter()
+                        $(.chain($args::valtype()))*
+                    ,
+                    R::valtype(),
+                );
 
                 let store_weak = store.weak();
                 let trampoline = host_trampoline::<$($args,)* R>;

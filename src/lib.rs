@@ -17,8 +17,7 @@
         clippy::float_arithmetic,
         clippy::mut_mut,
         clippy::nonminimal_bool,
-        clippy::option_map_unwrap_or,
-        clippy::option_map_unwrap_or_else,
+        clippy::map_unwrap_or,
         clippy::unicode_not_nfc,
         clippy::use_self
     )
@@ -124,6 +123,10 @@ struct CommonOptions {
     #[structopt(long)]
     enable_bulk_memory: Option<bool>,
 
+    /// Enable support for the multi-memory proposal
+    #[structopt(long)]
+    enable_multi_memory: bool,
+
     /// Enable all experimental Wasm features
     #[structopt(long)]
     enable_all: bool,
@@ -194,6 +197,7 @@ impl CommonOptions {
             )
             .wasm_multi_value(self.enable_multi_value.unwrap_or(true) || self.enable_all)
             .wasm_threads(self.enable_threads || self.enable_all)
+            .wasm_multi_memory(self.enable_multi_memory || self.enable_all)
             .cranelift_opt_level(self.opt_level())
             .strategy(pick_compilation_strategy(self.cranelift, self.lightbeam)?)?
             .profiler(pick_profiling_strategy(self.jitdump, self.vtune)?)?

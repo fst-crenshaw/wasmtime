@@ -1,9 +1,11 @@
-use crate::frame_info::GlobalFrameInfoRegistration;
-use crate::runtime::{Config, Engine};
 use crate::types::{EntityType, ExportType, ExternType, ImportType};
+use crate::Engine;
 use anyhow::{bail, Context, Result};
+use bincode::Options;
+use std::hash::Hash;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use wasmparser::Validator;
 #[cfg(feature = "cache")]
 use wasmtime_cache::ModuleCacheEntry;
 use wasmtime_jit::{CompilationArtifacts, CompiledModule};
@@ -79,8 +81,8 @@ use wasmtime_jit::{CompilationArtifacts, CompiledModule};
 #[derive(Clone)]
 pub struct Module {
     engine: Engine,
-    compiled: Arc<CompiledModule>,
-    frame_info_registration: Arc<Mutex<Option<Option<Arc<GlobalFrameInfoRegistration>>>>>,
+    compiled: Arc<[CompiledModule]>,
+    index: usize,
 }
 
 impl Module {
@@ -162,8 +164,7 @@ impl Module {
     /// See [`Module::new`] for other details.
     pub fn new_with_name(engine: &Engine, bytes: impl AsRef<[u8]>, name: &str) -> Result<Module> {
         let mut module = Module::new(engine, bytes.as_ref())?;
-        Arc::get_mut(&mut module.compiled)
-            .unwrap()
+        Arc::get_mut(&mut module.compiled).unwrap()[module.index]
             .module_mut()
             .expect("mutable module")
             .name = Some(name.to_string());
@@ -238,42 +239,25 @@ impl Module {
     /// # }
     /// ```
     pub fn from_binary(engine: &Engine, binary: &[u8]) -> Result<Module> {
-        Module::validate(engine, binary)?;
-        // Note that the call to `from_binary_unchecked` here should be ok
-        // because we previously validated the binary, meaning we're guaranteed
-        // to pass a valid binary for `engine`.
-        unsafe { Module::from_binary_unchecked(engine, binary) }
-    }
+        #[cfg(feature = "cache")]
+        let artifacts = ModuleCacheEntry::new("wasmtime", engine.cache_config())
+            .get_data((engine.compiler(), binary), |(compiler, binary)| {
+                CompilationArtifacts::build(compiler, binary)
+            })?;
+        #[cfg(not(feature = "cache"))]
+        let artifacts = CompilationArtifacts::build(engine.compiler(), binary)?;
 
-    /// Creates a new WebAssembly `Module` from the given in-memory `binary`
-    /// data, skipping validation and asserting that `binary` is a valid
-    /// WebAssembly module.
-    ///
-    /// This function is the same as [`Module::new`] except that it skips the
-    /// call to [`Module::validate`] and it does not support the text format of
-    /// WebAssembly. The WebAssembly binary is not validated for
-    /// correctness and it is simply assumed as valid.
-    ///
-    /// For more information about creation of a module and the `engine` argument
-    /// see the documentation of [`Module::new`].
-    ///
-    /// # Unsafety
-    ///
-    /// This function is `unsafe` due to the unchecked assumption that the input
-    /// `binary` is valid. If the `binary` is not actually a valid wasm binary it
-    /// may cause invalid machine code to get generated, cause panics, etc.
-    ///
-    /// It is only safe to call this method if [`Module::validate`] succeeds on
-    /// the same arguments passed to this function.
-    ///
-    /// # Errors
-    ///
-    /// This function may fail for many of the same reasons as [`Module::new`].
-    /// While this assumes that the binary is valid it still needs to actually
-    /// be somewhat valid for decoding purposes, and the basics of decoding can
-    /// still fail.
-    pub unsafe fn from_binary_unchecked(engine: &Engine, binary: &[u8]) -> Result<Module> {
-        Module::compile(engine, binary)
+        let compiled = CompiledModule::from_artifacts_list(
+            artifacts,
+            engine.compiler().isa(),
+            &*engine.config().profiler,
+        )?;
+
+        Ok(Module {
+            engine: engine.clone(),
+            index: compiled.len() - 1,
+            compiled: compiled.into(),
+        })
     }
 
     /// Validates `binary` input data as a WebAssembly binary given the
@@ -286,8 +270,7 @@ impl Module {
     /// configuration for WebAssembly features, for example, which are used to
     /// indicate what should be valid and what shouldn't be.
     ///
-    /// Validation automatically happens as part of [`Module::new`], but is a
-    /// requirement for [`Module::from_binary_unchecked`] to be safe.
+    /// Validation automatically happens as part of [`Module::new`].
     ///
     /// # Errors
     ///
@@ -297,46 +280,28 @@ impl Module {
     ///
     /// [binary]: https://webassembly.github.io/spec/core/binary/index.html
     pub fn validate(engine: &Engine, binary: &[u8]) -> Result<()> {
-        engine.config().validator().validate_all(binary)?;
+        let mut validator = Validator::new();
+        validator.wasm_features(engine.config().features);
+        validator.validate_all(binary)?;
         Ok(())
-    }
-
-    unsafe fn compile(engine: &Engine, binary: &[u8]) -> Result<Self> {
-        #[cfg(feature = "cache")]
-        let artifacts = ModuleCacheEntry::new("wasmtime", engine.cache_config())
-            .get_data((engine.compiler(), binary), |(compiler, binary)| {
-                CompilationArtifacts::build(compiler, binary)
-            })?;
-        #[cfg(not(feature = "cache"))]
-        let artifacts = CompilationArtifacts::build(engine.compiler(), binary)?;
-
-        let compiled = CompiledModule::from_artifacts(
-            artifacts,
-            engine.compiler().isa(),
-            &*engine.config().profiler,
-        )?;
-
-        Ok(Module {
-            engine: engine.clone(),
-            compiled: Arc::new(compiled),
-            frame_info_registration: Arc::new(Mutex::new(None)),
-        })
     }
 
     /// Serialize compilation artifacts to the buffer. See also `deseriaize`.
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let artifacts = (
-            compiler_fingerprint(self.engine.config()),
-            self.compiled.to_compilation_artifacts(),
+            compiler_fingerprint(&self.engine),
+            self.compiled
+                .iter()
+                .map(|i| i.compilation_artifacts())
+                .collect::<Vec<_>>(),
+            self.index,
         );
 
-        let mut buffer = Vec::new();
-        bincode::serialize_into(&mut buffer, &artifacts)?;
-
+        let buffer = bincode_options().serialize(&artifacts)?;
         Ok(buffer)
     }
 
-    /// Deserializes and creates a module from the compilatio nartifacts.
+    /// Deserializes and creates a module from the compilation artifacts.
     /// The `serialize` saves the compilation artifacts along with the host
     /// fingerprint, which consists of target, compiler flags, and wasmtime
     /// package version.
@@ -346,16 +311,16 @@ impl Module {
     /// for modifications or curruptions. All responsibily of signing and its
     /// verification falls on the embedder.
     pub fn deserialize(engine: &Engine, serialized: &[u8]) -> Result<Module> {
-        let expected_fingerprint = compiler_fingerprint(engine.config());
+        let expected_fingerprint = compiler_fingerprint(engine);
 
-        let (fingerprint, artifacts) =
-            bincode::deserialize_from::<_, (u64, CompilationArtifacts)>(serialized)
-                .context("Deserialize compilation artifacts")?;
+        let (fingerprint, artifacts, index) = bincode_options()
+            .deserialize::<(u64, _, _)>(serialized)
+            .context("Deserialize compilation artifacts")?;
         if fingerprint != expected_fingerprint {
             bail!("Incompatible compilation artifact");
         }
 
-        let compiled = CompiledModule::from_artifacts(
+        let compiled = CompiledModule::from_artifacts_list(
             artifacts,
             engine.compiler().isa(),
             &*engine.config().profiler,
@@ -363,13 +328,13 @@ impl Module {
 
         Ok(Module {
             engine: engine.clone(),
-            compiled: Arc::new(compiled),
-            frame_info_registration: Arc::new(Mutex::new(None)),
+            index,
+            compiled: compiled.into(),
         })
     }
 
     pub(crate) fn compiled_module(&self) -> &CompiledModule {
-        &self.compiled
+        &self.compiled[self.index]
     }
 
     /// Returns identifier/name that this [`Module`] has. This name
@@ -397,7 +362,7 @@ impl Module {
     /// # }
     /// ```
     pub fn name(&self) -> Option<&str> {
-        self.compiled.module().name.as_deref()
+        self.compiled_module().module().name.as_deref()
     }
 
     /// Returns the list of imports that this [`Module`] has and must be
@@ -452,7 +417,7 @@ impl Module {
     pub fn imports<'module>(
         &'module self,
     ) -> impl ExactSizeIterator<Item = ImportType<'module>> + 'module {
-        let module = self.compiled.module();
+        let module = self.compiled_module().module();
         module
             .imports
             .iter()
@@ -519,7 +484,7 @@ impl Module {
     pub fn exports<'module>(
         &'module self,
     ) -> impl ExactSizeIterator<Item = ExportType<'module>> + 'module {
-        let module = self.compiled.module();
+        let module = self.compiled_module().module();
         module.exports.iter().map(move |(name, entity_index)| {
             let r#type = EntityType::new(entity_index, module);
             ExportType::new(name, r#type)
@@ -570,7 +535,7 @@ impl Module {
     /// # }
     /// ```
     pub fn get_export<'module>(&'module self, name: &'module str) -> Option<ExternType> {
-        let module = self.compiled.module();
+        let module = self.compiled_module().module();
         let entity_index = module.exports.get(name)?;
         Some(EntityType::new(entity_index, module).extern_type())
     }
@@ -579,25 +544,23 @@ impl Module {
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
-
-    /// Register this module's stack frame information into the global scope.
-    ///
-    /// This is required to ensure that any traps can be properly symbolicated.
-    pub(crate) fn register_frame_info(&self) -> Option<Arc<GlobalFrameInfoRegistration>> {
-        let mut info = self.frame_info_registration.lock().unwrap();
-        if let Some(info) = &*info {
-            return info.clone();
-        }
-        let ret = super::frame_info::register(&self.compiled).map(Arc::new);
-        *info = Some(ret.clone());
-        return ret;
-    }
 }
 
-fn compiler_fingerprint(config: &Config) -> u64 {
+fn bincode_options() -> impl Options {
+    // Use a variable-length integer encoding instead of fixed length. The
+    // module shown on #2318 gets compressed from ~160MB to ~110MB simply using
+    // this, presumably because there's a lot of 8-byte integers which generally
+    // have small values. Local testing shows that the deserialization
+    // performance, while higher, is in the few-percent range. For huge size
+    // savings this seems worthwhile to lose a small percentage of
+    // deserialization performance.
+    bincode::DefaultOptions::new().with_varint_encoding()
+}
+
+fn compiler_fingerprint(engine: &Engine) -> u64 {
     use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    config.compiler_fingerprint(&mut hasher);
+    engine.compiler().hash(&mut hasher);
     hasher.finish()
 }
 

@@ -7,11 +7,10 @@
 //!
 //! - Floating-point immediates (FIMM instruction).
 
-use crate::ir;
 use crate::ir::condcodes::{FloatCC, IntCC};
 use crate::ir::types::*;
 use crate::ir::Inst as IRInst;
-use crate::ir::{InstructionData, Opcode, TrapCode, Type};
+use crate::ir::{Opcode, Type};
 use crate::machinst::lower::*;
 use crate::machinst::*;
 use crate::CodegenResult;
@@ -21,6 +20,7 @@ use crate::isa::aarch64::AArch64Backend;
 
 use super::lower_inst;
 
+use crate::data_value::DataValue;
 use log::{debug, trace};
 use regalloc::{Reg, RegClass, Writable};
 use smallvec::SmallVec;
@@ -107,31 +107,11 @@ pub(crate) enum ResultRegImmShift {
 }
 
 //============================================================================
-// Instruction input "slots".
-//
-// We use these types to refer to operand numbers, and result numbers, together
-// with the associated instruction, in a type-safe way.
-
-/// Identifier for a particular input of an instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct InsnInput {
-    pub(crate) insn: IRInst,
-    pub(crate) input: usize,
-}
-
-/// Identifier for a particular output of an instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct InsnOutput {
-    pub(crate) insn: IRInst,
-    pub(crate) output: usize,
-}
-
-//============================================================================
 // Lowering: convert instruction inputs to forms that we can use.
 
 /// Lower an instruction input to a 64-bit constant, if possible.
 pub(crate) fn input_to_const<C: LowerCtx<I = Inst>>(ctx: &mut C, input: InsnInput) -> Option<u64> {
-    let input = ctx.get_input(input.insn, input.input);
+    let input = ctx.get_input_as_source_or_const(input.insn, input.input);
     input.constant
 }
 
@@ -147,22 +127,9 @@ pub(crate) fn const_param_to_u128<C: LowerCtx<I = Inst>>(
     ctx: &mut C,
     inst: IRInst,
 ) -> Option<u128> {
-    let data = match ctx.data(inst) {
-        &InstructionData::Shuffle { mask, .. } => ctx.get_immediate(mask),
-        &InstructionData::UnaryConst {
-            constant_handle, ..
-        } => ctx.get_constant_data(constant_handle),
-        _ => return None,
-    };
-    let data = data.clone().into_vec();
-
-    if data.len() == 16 {
-        let mut bytes = [0u8; 16];
-
-        bytes.copy_from_slice(&data);
-        Some(u128::from_le_bytes(bytes))
-    } else {
-        None
+    match ctx.get_immediate(inst) {
+        Some(DataValue::V128(bytes)) => Some(u128::from_le_bytes(bytes)),
+        _ => None,
     }
 }
 
@@ -191,11 +158,6 @@ impl NarrowValueMode {
     }
 }
 
-/// Allocate a register for an instruction output and return it.
-pub(crate) fn get_output_reg<C: LowerCtx<I = Inst>>(ctx: &mut C, out: InsnOutput) -> Writable<Reg> {
-    ctx.get_output(out.insn, out.output)
-}
-
 /// Lower an instruction input to a reg.
 ///
 /// The given register will be extended appropriately, according to
@@ -209,14 +171,14 @@ pub(crate) fn put_input_in_reg<C: LowerCtx<I = Inst>>(
     debug!("put_input_in_reg: input {:?}", input);
     let ty = ctx.input_ty(input.insn, input.input);
     let from_bits = ty_bits(ty) as u8;
-    let inputs = ctx.get_input(input.insn, input.input);
+    let inputs = ctx.get_input_as_source_or_const(input.insn, input.input);
     let in_reg = if let Some(c) = inputs.constant {
+        // Generate constants fresh at each use to minimize long-range register pressure.
         let masked = if from_bits < 64 {
             c & ((1u64 << from_bits) - 1)
         } else {
             c
         };
-        // Generate constants fresh at each use to minimize long-range register pressure.
         let to_reg = ctx.alloc_tmp(Inst::rc_for_type(ty).unwrap(), ty);
         for inst in Inst::gen_constant(to_reg, masked, ty, |reg_class, ty| {
             ctx.alloc_tmp(reg_class, ty)
@@ -227,8 +189,7 @@ pub(crate) fn put_input_in_reg<C: LowerCtx<I = Inst>>(
         }
         to_reg.to_reg()
     } else {
-        ctx.use_input_reg(inputs);
-        inputs.reg
+        ctx.put_input_in_reg(input.insn, input.input)
     };
 
     match (narrow_mode, from_bits) {
@@ -310,7 +271,7 @@ fn put_input_in_rs<C: LowerCtx<I = Inst>>(
     input: InsnInput,
     narrow_mode: NarrowValueMode,
 ) -> ResultRS {
-    let inputs = ctx.get_input(input.insn, input.input);
+    let inputs = ctx.get_input_as_source_or_const(input.insn, input.input);
     if let Some((insn, 0)) = inputs.inst {
         let op = ctx.data(insn).opcode();
 
@@ -343,7 +304,7 @@ fn put_input_in_rse<C: LowerCtx<I = Inst>>(
     input: InsnInput,
     narrow_mode: NarrowValueMode,
 ) -> ResultRSE {
-    let inputs = ctx.get_input(input.insn, input.input);
+    let inputs = ctx.get_input_as_source_or_const(input.insn, input.input);
     if let Some((insn, 0)) = inputs.inst {
         let op = ctx.data(insn).opcode();
         let out_ty = ctx.output_ty(insn, 0);
@@ -612,11 +573,11 @@ type AddressAddend64List = SmallVec<[Reg; 4]>;
 /// - NarrowValueMode::ZeroExtend64: the associated input is 32 bits wide;
 ///                                  do a zero-extension.
 ///
-/// We do not descend further into the inputs of extensions, because supporting
-/// (e.g.) a 32-bit add that is later extended would require additional masking
-/// of high-order bits, which is too complex. So, in essence, we descend any
-/// number of adds from the roots, collecting all 64-bit address addends; then
-/// possibly support extensions at these leaves.
+/// We do not descend further into the inputs of extensions (unless it is a constant),
+/// because supporting (e.g.) a 32-bit add that is later extended would require
+/// additional masking of high-order bits, which is too complex. So, in essence, we
+/// descend any number of adds from the roots, collecting all 64-bit address addends;
+/// then possibly support extensions at these leaves.
 fn collect_address_addends<C: LowerCtx<I = Inst>>(
     ctx: &mut C,
     roots: &[InsnInput],
@@ -647,8 +608,20 @@ fn collect_address_addends<C: LowerCtx<I = Inst>>(
                         ExtendOp::SXTW
                     };
                     let extendee_input = InsnInput { insn, input: 0 };
-                    let reg = put_input_in_reg(ctx, extendee_input, NarrowValueMode::None);
-                    result32.push((reg, extendop));
+                    // If the input is a zero-extension of a constant, add the value to the known
+                    // offset.
+                    // Only do this for zero-extension, as generating a sign-extended
+                    // constant may be more instructions than using the 'SXTW' addressing mode.
+                    if let (Some(insn), ExtendOp::UXTW) = (
+                        maybe_input_insn(ctx, extendee_input, Opcode::Iconst),
+                        extendop,
+                    ) {
+                        let value = ctx.get_constant(insn).unwrap() as i64;
+                        offset += value;
+                    } else {
+                        let reg = put_input_in_reg(ctx, extendee_input, NarrowValueMode::None);
+                        result32.push((reg, extendop));
+                    }
                 }
                 Opcode::Uextend | Opcode::Sextend => {
                     let reg = put_input_in_reg(ctx, input, NarrowValueMode::None);
@@ -851,7 +824,11 @@ pub(crate) fn lower_constant_f32<C: LowerCtx<I = Inst>>(
     rd: Writable<Reg>,
     value: f32,
 ) {
-    ctx.emit(Inst::load_fp_constant32(rd, value));
+    let alloc_tmp = |class, ty| ctx.alloc_tmp(class, ty);
+
+    for inst in Inst::load_fp_constant32(rd, value.to_bits(), alloc_tmp) {
+        ctx.emit(inst);
+    }
 }
 
 pub(crate) fn lower_constant_f64<C: LowerCtx<I = Inst>>(
@@ -859,7 +836,11 @@ pub(crate) fn lower_constant_f64<C: LowerCtx<I = Inst>>(
     rd: Writable<Reg>,
     value: f64,
 ) {
-    ctx.emit(Inst::load_fp_constant64(rd, value));
+    let alloc_tmp = |class, ty| ctx.alloc_tmp(class, ty);
+
+    for inst in Inst::load_fp_constant64(rd, value.to_bits(), alloc_tmp) {
+        ctx.emit(inst);
+    }
 }
 
 pub(crate) fn lower_constant_f128<C: LowerCtx<I = Inst>>(
@@ -867,7 +848,48 @@ pub(crate) fn lower_constant_f128<C: LowerCtx<I = Inst>>(
     rd: Writable<Reg>,
     value: u128,
 ) {
-    ctx.emit(Inst::load_fp_constant128(rd, value));
+    if value == 0 {
+        // Fast-track a common case.  The general case, viz, calling `Inst::load_fp_constant128`,
+        // is potentially expensive.
+        ctx.emit(Inst::VecDupImm {
+            rd,
+            imm: ASIMDMovModImm::zero(),
+            invert: false,
+            size: VectorSize::Size8x16,
+        });
+    } else {
+        let alloc_tmp = |class, ty| ctx.alloc_tmp(class, ty);
+        for inst in Inst::load_fp_constant128(rd, value, alloc_tmp) {
+            ctx.emit(inst);
+        }
+    }
+}
+
+pub(crate) fn lower_splat_const<C: LowerCtx<I = Inst>>(
+    ctx: &mut C,
+    rd: Writable<Reg>,
+    value: u64,
+    size: VectorSize,
+) {
+    let (value, narrow_size) = match size.lane_size() {
+        ScalarSize::Size8 => (value as u8 as u64, ScalarSize::Size128),
+        ScalarSize::Size16 => (value as u16 as u64, ScalarSize::Size8),
+        ScalarSize::Size32 => (value as u32 as u64, ScalarSize::Size16),
+        ScalarSize::Size64 => (value, ScalarSize::Size32),
+        _ => unreachable!(),
+    };
+    let (value, size) = match Inst::get_replicated_vector_pattern(value as u128, narrow_size) {
+        Some((value, lane_size)) => (
+            value,
+            VectorSize::from_lane_size(lane_size, size.is_128bits()),
+        ),
+        None => (value, size),
+    };
+    let alloc_tmp = |class, ty| ctx.alloc_tmp(class, ty);
+
+    for inst in Inst::load_replicated_vector_pattern(rd, value, size, alloc_tmp) {
+        ctx.emit(inst);
+    }
 }
 
 pub(crate) fn lower_condcode(cc: IntCC) -> Cond {
@@ -1023,65 +1045,13 @@ pub(crate) fn choose_32_64<T: Copy>(ty: Type, op32: T, op64: T) -> T {
     }
 }
 
-pub(crate) fn ldst_offset(data: &InstructionData) -> Option<i32> {
-    match data {
-        &InstructionData::Load { offset, .. }
-        | &InstructionData::StackLoad { offset, .. }
-        | &InstructionData::LoadComplex { offset, .. }
-        | &InstructionData::Store { offset, .. }
-        | &InstructionData::StackStore { offset, .. }
-        | &InstructionData::StoreComplex { offset, .. } => Some(offset.into()),
-        _ => None,
-    }
-}
-
-pub(crate) fn inst_condcode(data: &InstructionData) -> Option<IntCC> {
-    match data {
-        &InstructionData::IntCond { cond, .. }
-        | &InstructionData::BranchIcmp { cond, .. }
-        | &InstructionData::IntCompare { cond, .. }
-        | &InstructionData::IntCondTrap { cond, .. }
-        | &InstructionData::BranchInt { cond, .. }
-        | &InstructionData::IntSelect { cond, .. }
-        | &InstructionData::IntCompareImm { cond, .. } => Some(cond),
-        _ => None,
-    }
-}
-
-pub(crate) fn inst_fp_condcode(data: &InstructionData) -> Option<FloatCC> {
-    match data {
-        &InstructionData::BranchFloat { cond, .. }
-        | &InstructionData::FloatCompare { cond, .. }
-        | &InstructionData::FloatCond { cond, .. }
-        | &InstructionData::FloatCondTrap { cond, .. } => Some(cond),
-        _ => None,
-    }
-}
-
-pub(crate) fn inst_trapcode(data: &InstructionData) -> Option<TrapCode> {
-    match data {
-        &InstructionData::Trap { code, .. }
-        | &InstructionData::CondTrap { code, .. }
-        | &InstructionData::IntCondTrap { code, .. }
-        | &InstructionData::FloatCondTrap { code, .. } => Some(code),
-        _ => None,
-    }
-}
-
-pub(crate) fn inst_atomic_rmw_op(data: &InstructionData) -> Option<ir::AtomicRmwOp> {
-    match data {
-        &InstructionData::AtomicRmw { op, .. } => Some(op),
-        _ => None,
-    }
-}
-
 /// Checks for an instance of `op` feeding the given input.
 pub(crate) fn maybe_input_insn<C: LowerCtx<I = Inst>>(
     c: &mut C,
     input: InsnInput,
     op: Opcode,
 ) -> Option<IRInst> {
-    let inputs = c.get_input(input.insn, input.input);
+    let inputs = c.get_input_as_source_or_const(input.insn, input.input);
     debug!(
         "maybe_input_insn: input {:?} has options {:?}; looking for op {:?}",
         input, inputs, op
@@ -1121,14 +1091,14 @@ pub(crate) fn maybe_input_insn_via_conv<C: LowerCtx<I = Inst>>(
     op: Opcode,
     conv: Opcode,
 ) -> Option<IRInst> {
-    let inputs = c.get_input(input.insn, input.input);
+    let inputs = c.get_input_as_source_or_const(input.insn, input.input);
     if let Some((src_inst, _)) = inputs.inst {
         let data = c.data(src_inst);
         if data.opcode() == op {
             return Some(src_inst);
         }
         if data.opcode() == conv {
-            let inputs = c.get_input(src_inst, 0);
+            let inputs = c.get_input_as_source_or_const(src_inst, 0);
             if let Some((src_inst, _)) = inputs.inst {
                 let data = c.data(src_inst);
                 if data.opcode() == op {
@@ -1199,6 +1169,59 @@ pub(crate) fn normalize_bool_result<C: LowerCtx<I = Inst>>(
     }
 }
 
+/// This is target-word-size dependent.  And it excludes booleans and reftypes.
+pub(crate) fn is_valid_atomic_transaction_ty(ty: Type) -> bool {
+    match ty {
+        I8 | I16 | I32 | I64 => true,
+        _ => false,
+    }
+}
+
+fn load_op_to_ty(op: Opcode) -> Option<Type> {
+    match op {
+        Opcode::Sload8 | Opcode::Uload8 | Opcode::Sload8Complex | Opcode::Uload8Complex => Some(I8),
+        Opcode::Sload16 | Opcode::Uload16 | Opcode::Sload16Complex | Opcode::Uload16Complex => {
+            Some(I16)
+        }
+        Opcode::Sload32 | Opcode::Uload32 | Opcode::Sload32Complex | Opcode::Uload32Complex => {
+            Some(I32)
+        }
+        Opcode::Load | Opcode::LoadComplex => None,
+        Opcode::Sload8x8 | Opcode::Uload8x8 | Opcode::Sload8x8Complex | Opcode::Uload8x8Complex => {
+            Some(I8X8)
+        }
+        Opcode::Sload16x4
+        | Opcode::Uload16x4
+        | Opcode::Sload16x4Complex
+        | Opcode::Uload16x4Complex => Some(I16X4),
+        Opcode::Sload32x2
+        | Opcode::Uload32x2
+        | Opcode::Sload32x2Complex
+        | Opcode::Uload32x2Complex => Some(I32X2),
+        _ => None,
+    }
+}
+
+/// Helper to lower a load instruction; this is used in several places, because
+/// a load can sometimes be merged into another operation.
+pub(crate) fn lower_load<C: LowerCtx<I = Inst>, F: FnMut(&mut C, Writable<Reg>, Type, AMode)>(
+    ctx: &mut C,
+    ir_inst: IRInst,
+    inputs: &[InsnInput],
+    output: InsnOutput,
+    mut f: F,
+) {
+    let op = ctx.data(ir_inst).opcode();
+
+    let elem_ty = load_op_to_ty(op).unwrap_or_else(|| ctx.output_ty(ir_inst, 0));
+
+    let off = ctx.data(ir_inst).load_store_offset().unwrap();
+    let mem = lower_address(ctx, elem_ty, &inputs[..], off);
+    let rd = get_output_reg(ctx, output);
+
+    f(ctx, rd, elem_ty, mem);
+}
+
 //=============================================================================
 // Lowering-backend trait implementation.
 
@@ -1214,9 +1237,8 @@ impl LowerBackend for AArch64Backend {
         ctx: &mut C,
         branches: &[IRInst],
         targets: &[MachLabel],
-        fallthrough: Option<MachLabel>,
     ) -> CodegenResult<()> {
-        lower_inst::lower_branch(ctx, branches, targets, fallthrough)
+        lower_inst::lower_branch(ctx, branches, targets)
     }
 
     fn maybe_pinned_reg(&self) -> Option<Reg> {

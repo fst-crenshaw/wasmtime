@@ -3,18 +3,26 @@
 use super::regs::{self, show_ireg_sized};
 use super::EmitState;
 use crate::ir::condcodes::{FloatCC, IntCC};
+use crate::ir::MemFlags;
+use crate::isa::x64::inst::Inst;
 use crate::machinst::*;
-use core::fmt::Debug;
-use regalloc::{RealRegUniverse, Reg, RegClass, RegUsageCollector, RegUsageMapper};
+use regalloc::{
+    PrettyPrint, PrettyPrintSized, RealRegUniverse, Reg, RegClass, RegUsageCollector,
+    RegUsageMapper, Writable,
+};
 use std::fmt;
-use std::string::{String, ToString};
+use std::string::String;
 
 /// A possible addressing mode (amode) that can be used in instructions.
 /// These denote a 64-bit value only.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Amode {
     /// Immediate sign-extended and a Register.
-    ImmReg { simm32: u32, base: Reg },
+    ImmReg {
+        simm32: u32,
+        base: Reg,
+        flags: MemFlags,
+    },
 
     /// sign-extend-32-to-64(Immediate) + Register1 + (Register2 << Shift)
     ImmRegRegShift {
@@ -22,17 +30,22 @@ pub enum Amode {
         base: Reg,
         index: Reg,
         shift: u8, /* 0 .. 3 only */
+        flags: MemFlags,
     },
 
     /// sign-extend-32-to-64(Immediate) + RIP (instruction pointer).
     /// To wit: not supported in 32-bits mode.
-    RipRelative { target: BranchTarget },
+    RipRelative { target: MachLabel },
 }
 
 impl Amode {
     pub(crate) fn imm_reg(simm32: u32, base: Reg) -> Self {
         debug_assert!(base.get_class() == RegClass::I64);
-        Self::ImmReg { simm32, base }
+        Self::ImmReg {
+            simm32,
+            base,
+            flags: MemFlags::trusted(),
+        }
     }
 
     pub(crate) fn imm_reg_reg_shift(simm32: u32, base: Reg, index: Reg, shift: u8) -> Self {
@@ -44,11 +57,36 @@ impl Amode {
             base,
             index,
             shift,
+            flags: MemFlags::trusted(),
         }
     }
 
-    pub(crate) fn rip_relative(target: BranchTarget) -> Self {
+    pub(crate) fn rip_relative(target: MachLabel) -> Self {
         Self::RipRelative { target }
+    }
+
+    pub(crate) fn with_flags(&self, flags: MemFlags) -> Self {
+        match self {
+            &Self::ImmReg { simm32, base, .. } => Self::ImmReg {
+                simm32,
+                base,
+                flags,
+            },
+            &Self::ImmRegRegShift {
+                simm32,
+                base,
+                index,
+                shift,
+                ..
+            } => Self::ImmRegRegShift {
+                simm32,
+                base,
+                index,
+                shift,
+                flags,
+            },
+            _ => panic!("Amode {:?} cannot take memflags", self),
+        }
     }
 
     /// Add the regs mentioned by `self` to `collector`.
@@ -66,12 +104,24 @@ impl Amode {
             }
         }
     }
+
+    pub(crate) fn get_flags(&self) -> MemFlags {
+        match self {
+            Amode::ImmReg { flags, .. } => *flags,
+            Amode::ImmRegRegShift { flags, .. } => *flags,
+            Amode::RipRelative { .. } => MemFlags::trusted(),
+        }
+    }
+
+    pub(crate) fn can_trap(&self) -> bool {
+        !self.get_flags().notrap()
+    }
 }
 
-impl ShowWithRRU for Amode {
+impl PrettyPrint for Amode {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
         match self {
-            Amode::ImmReg { simm32, base } => {
+            Amode::ImmReg { simm32, base, .. } => {
                 format!("{}({})", *simm32 as i32, base.show_rru(mb_rru))
             }
             Amode::ImmRegRegShift {
@@ -79,6 +129,7 @@ impl ShowWithRRU for Amode {
                 base,
                 index,
                 shift,
+                ..
             } => format!(
                 "{}({},{},{})",
                 *simm32 as i32,
@@ -86,13 +137,7 @@ impl ShowWithRRU for Amode {
                 index.show_rru(mb_rru),
                 1 << shift
             ),
-            Amode::RipRelative { ref target } => format!(
-                "{}(%rip)",
-                match target {
-                    BranchTarget::Label(label) => format!("label{}", label.get()),
-                    BranchTarget::ResolvedOffset(offset) => offset.to_string(),
-                }
-            ),
+            Amode::RipRelative { ref target } => format!("label{}(%rip)", target.get()),
         }
     }
 }
@@ -108,6 +153,9 @@ pub enum SyntheticAmode {
     /// A (virtual) offset to the "nominal SP" value, which will be recomputed as we push and pop
     /// within the function.
     NominalSPOffset { simm32: u32 },
+
+    /// A virtual offset to a constant that will be emitted in the constant section of the buffer.
+    ConstantOffset(VCodeConstant),
 }
 
 impl SyntheticAmode {
@@ -122,6 +170,7 @@ impl SyntheticAmode {
             SyntheticAmode::NominalSPOffset { .. } => {
                 // Nothing to do; the base is SP and isn't involved in regalloc.
             }
+            SyntheticAmode::ConstantOffset(_) => {}
         }
     }
 
@@ -131,10 +180,11 @@ impl SyntheticAmode {
             SyntheticAmode::NominalSPOffset { .. } => {
                 // Nothing to do.
             }
+            SyntheticAmode::ConstantOffset(_) => {}
         }
     }
 
-    pub(crate) fn finalize(&self, state: &mut EmitState) -> Amode {
+    pub(crate) fn finalize(&self, state: &mut EmitState, buffer: &MachBuffer<Inst>) -> Amode {
         match self {
             SyntheticAmode::Real(addr) => addr.clone(),
             SyntheticAmode::NominalSPOffset { simm32 } => {
@@ -146,6 +196,9 @@ impl SyntheticAmode {
                 );
                 Amode::imm_reg(off as u32, regs::rsp())
             }
+            SyntheticAmode::ConstantOffset(c) => {
+                Amode::rip_relative(buffer.get_label_for_constant(*c))
+            }
         }
     }
 }
@@ -156,13 +209,14 @@ impl Into<SyntheticAmode> for Amode {
     }
 }
 
-impl ShowWithRRU for SyntheticAmode {
+impl PrettyPrint for SyntheticAmode {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
         match self {
             SyntheticAmode::Real(addr) => addr.show_rru(mb_rru),
             SyntheticAmode::NominalSPOffset { simm32 } => {
                 format!("rsp({} + virtual offset)", *simm32 as i32)
             }
+            SyntheticAmode::ConstantOffset(c) => format!("const({:?})", c),
         }
     }
 }
@@ -214,11 +268,13 @@ impl RegMemImm {
     }
 }
 
-impl ShowWithRRU for RegMemImm {
+impl PrettyPrint for RegMemImm {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
         self.show_rru_sized(mb_rru, 8)
     }
+}
 
+impl PrettyPrintSized for RegMemImm {
     fn show_rru_sized(&self, mb_rru: Option<&RealRegUniverse>, size: u8) -> String {
         match self {
             Self::Reg { reg } => show_ireg_sized(*reg, mb_rru, size),
@@ -265,11 +321,19 @@ impl RegMem {
     }
 }
 
-impl ShowWithRRU for RegMem {
+impl From<Writable<Reg>> for RegMem {
+    fn from(r: Writable<Reg>) -> Self {
+        RegMem::reg(r.to_reg())
+    }
+}
+
+impl PrettyPrint for RegMem {
     fn show_rru(&self, mb_rru: Option<&RealRegUniverse>) -> String {
         self.show_rru_sized(mb_rru, 8)
     }
+}
 
+impl PrettyPrintSized for RegMem {
     fn show_rru_sized(&self, mb_rru: Option<&RealRegUniverse>, size: u8) -> String {
         match self {
             RegMem::Reg { reg } => show_ireg_sized(*reg, mb_rru, size),
@@ -336,7 +400,9 @@ impl fmt::Display for UnaryRmROpcode {
 pub(crate) enum InstructionSet {
     SSE,
     SSE2,
+    SSSE3,
     SSE41,
+    SSE42,
 }
 
 /// Some SSE operations requiring 2 operands r/m and r.
@@ -356,12 +422,14 @@ pub enum SseOpcode {
     Cmppd,
     Cmpss,
     Cmpsd,
+    Cvtdq2ps,
     Cvtsd2ss,
     Cvtsd2si,
     Cvtsi2ss,
     Cvtsi2sd,
     Cvtss2si,
     Cvtss2sd,
+    Cvttps2dq,
     Cvttss2si,
     Cvttsd2si,
     Divps,
@@ -382,6 +450,9 @@ pub enum SseOpcode {
     Movd,
     Movdqa,
     Movdqu,
+    Movlhps,
+    Movmskps,
+    Movmskpd,
     Movq,
     Movss,
     Movsd,
@@ -393,13 +464,55 @@ pub enum SseOpcode {
     Mulsd,
     Orps,
     Orpd,
+    Pabsb,
+    Pabsw,
+    Pabsd,
+    Packsswb,
     Paddb,
     Paddd,
     Paddq,
     Paddw,
+    Paddsb,
+    Paddsw,
+    Paddusb,
+    Paddusw,
+    Pand,
+    Pandn,
+    Pavgb,
+    Pavgw,
+    Pcmpeqb,
+    Pcmpeqw,
+    Pcmpeqd,
+    Pcmpeqq,
+    Pcmpgtb,
+    Pcmpgtw,
+    Pcmpgtd,
+    Pcmpgtq,
+    Pextrb,
+    Pextrw,
+    Pextrd,
+    Pinsrb,
+    Pinsrw,
+    Pinsrd,
+    Pmaxsb,
+    Pmaxsw,
+    Pmaxsd,
+    Pmaxub,
+    Pmaxuw,
+    Pmaxud,
+    Pminsb,
+    Pminsw,
+    Pminsd,
+    Pminub,
+    Pminuw,
+    Pminud,
+    Pmovmskb,
     Pmulld,
     Pmullw,
     Pmuludq,
+    Por,
+    Pshufb,
+    Pshufd,
     Psllw,
     Pslld,
     Psllq,
@@ -412,6 +525,13 @@ pub enum SseOpcode {
     Psubd,
     Psubq,
     Psubw,
+    Psubsb,
+    Psubsw,
+    Psubusb,
+    Psubusw,
+    Ptest,
+    Punpckhbw,
+    Punpcklbw,
     Pxor,
     Rcpss,
     Roundss,
@@ -453,6 +573,8 @@ impl SseOpcode {
             | SseOpcode::Minps
             | SseOpcode::Minss
             | SseOpcode::Movaps
+            | SseOpcode::Movlhps
+            | SseOpcode::Movmskps
             | SseOpcode::Movss
             | SseOpcode::Movups
             | SseOpcode::Mulps
@@ -474,10 +596,12 @@ impl SseOpcode {
             | SseOpcode::Cmppd
             | SseOpcode::Cmpsd
             | SseOpcode::Comisd
+            | SseOpcode::Cvtdq2ps
             | SseOpcode::Cvtsd2ss
             | SseOpcode::Cvtsd2si
             | SseOpcode::Cvtsi2sd
             | SseOpcode::Cvtss2sd
+            | SseOpcode::Cvttps2dq
             | SseOpcode::Cvttsd2si
             | SseOpcode::Divpd
             | SseOpcode::Divsd
@@ -487,6 +611,7 @@ impl SseOpcode {
             | SseOpcode::Minsd
             | SseOpcode::Movapd
             | SseOpcode::Movd
+            | SseOpcode::Movmskpd
             | SseOpcode::Movq
             | SseOpcode::Movsd
             | SseOpcode::Movupd
@@ -495,12 +620,36 @@ impl SseOpcode {
             | SseOpcode::Mulpd
             | SseOpcode::Mulsd
             | SseOpcode::Orpd
+            | SseOpcode::Packsswb
             | SseOpcode::Paddb
             | SseOpcode::Paddd
             | SseOpcode::Paddq
             | SseOpcode::Paddw
+            | SseOpcode::Paddsb
+            | SseOpcode::Paddsw
+            | SseOpcode::Paddusb
+            | SseOpcode::Paddusw
+            | SseOpcode::Pand
+            | SseOpcode::Pandn
+            | SseOpcode::Pavgb
+            | SseOpcode::Pavgw
+            | SseOpcode::Pcmpeqb
+            | SseOpcode::Pcmpeqw
+            | SseOpcode::Pcmpeqd
+            | SseOpcode::Pcmpgtb
+            | SseOpcode::Pcmpgtw
+            | SseOpcode::Pcmpgtd
+            | SseOpcode::Pextrw
+            | SseOpcode::Pinsrw
+            | SseOpcode::Pmaxsw
+            | SseOpcode::Pmaxub
+            | SseOpcode::Pminsw
+            | SseOpcode::Pminub
+            | SseOpcode::Pmovmskb
             | SseOpcode::Pmullw
             | SseOpcode::Pmuludq
+            | SseOpcode::Por
+            | SseOpcode::Pshufd
             | SseOpcode::Psllw
             | SseOpcode::Pslld
             | SseOpcode::Psllq
@@ -513,6 +662,12 @@ impl SseOpcode {
             | SseOpcode::Psubd
             | SseOpcode::Psubq
             | SseOpcode::Psubw
+            | SseOpcode::Psubsb
+            | SseOpcode::Psubsw
+            | SseOpcode::Psubusb
+            | SseOpcode::Psubusw
+            | SseOpcode::Punpckhbw
+            | SseOpcode::Punpcklbw
             | SseOpcode::Pxor
             | SseOpcode::Sqrtpd
             | SseOpcode::Sqrtsd
@@ -521,9 +676,28 @@ impl SseOpcode {
             | SseOpcode::Ucomisd
             | SseOpcode::Xorpd => SSE2,
 
-            SseOpcode::Insertps | SseOpcode::Pmulld | SseOpcode::Roundss | SseOpcode::Roundsd => {
-                SSE41
-            }
+            SseOpcode::Pabsb | SseOpcode::Pabsw | SseOpcode::Pabsd | SseOpcode::Pshufb => SSSE3,
+
+            SseOpcode::Insertps
+            | SseOpcode::Pcmpeqq
+            | SseOpcode::Pextrb
+            | SseOpcode::Pextrd
+            | SseOpcode::Pinsrb
+            | SseOpcode::Pinsrd
+            | SseOpcode::Pmaxsb
+            | SseOpcode::Pmaxsd
+            | SseOpcode::Pmaxuw
+            | SseOpcode::Pmaxud
+            | SseOpcode::Pminsb
+            | SseOpcode::Pminsd
+            | SseOpcode::Pminuw
+            | SseOpcode::Pminud
+            | SseOpcode::Pmulld
+            | SseOpcode::Ptest
+            | SseOpcode::Roundss
+            | SseOpcode::Roundsd => SSE41,
+
+            SseOpcode::Pcmpgtq => SSE42,
         }
     }
 
@@ -553,12 +727,14 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Cmpsd => "cmpsd",
             SseOpcode::Comiss => "comiss",
             SseOpcode::Comisd => "comisd",
+            SseOpcode::Cvtdq2ps => "cvtdq2ps",
             SseOpcode::Cvtsd2ss => "cvtsd2ss",
             SseOpcode::Cvtsd2si => "cvtsd2si",
             SseOpcode::Cvtsi2ss => "cvtsi2ss",
             SseOpcode::Cvtsi2sd => "cvtsi2sd",
             SseOpcode::Cvtss2si => "cvtss2si",
             SseOpcode::Cvtss2sd => "cvtss2sd",
+            SseOpcode::Cvttps2dq => "cvttps2dq",
             SseOpcode::Cvttss2si => "cvttss2si",
             SseOpcode::Cvttsd2si => "cvttsd2si",
             SseOpcode::Divps => "divps",
@@ -579,6 +755,9 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Movd => "movd",
             SseOpcode::Movdqa => "movdqa",
             SseOpcode::Movdqu => "movdqu",
+            SseOpcode::Movlhps => "movlhps",
+            SseOpcode::Movmskps => "movmskps",
+            SseOpcode::Movmskpd => "movmskpd",
             SseOpcode::Movq => "movq",
             SseOpcode::Movss => "movss",
             SseOpcode::Movsd => "movsd",
@@ -590,13 +769,55 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Mulsd => "mulsd",
             SseOpcode::Orpd => "orpd",
             SseOpcode::Orps => "orps",
+            SseOpcode::Pabsb => "pabsb",
+            SseOpcode::Pabsw => "pabsw",
+            SseOpcode::Pabsd => "pabsd",
+            SseOpcode::Packsswb => "packsswb",
             SseOpcode::Paddb => "paddb",
             SseOpcode::Paddd => "paddd",
             SseOpcode::Paddq => "paddq",
             SseOpcode::Paddw => "paddw",
+            SseOpcode::Paddsb => "paddsb",
+            SseOpcode::Paddsw => "paddsw",
+            SseOpcode::Paddusb => "paddusb",
+            SseOpcode::Paddusw => "paddusw",
+            SseOpcode::Pand => "pand",
+            SseOpcode::Pandn => "pandn",
+            SseOpcode::Pavgb => "pavgb",
+            SseOpcode::Pavgw => "pavgw",
+            SseOpcode::Pcmpeqb => "pcmpeqb",
+            SseOpcode::Pcmpeqw => "pcmpeqw",
+            SseOpcode::Pcmpeqd => "pcmpeqd",
+            SseOpcode::Pcmpeqq => "pcmpeqq",
+            SseOpcode::Pcmpgtb => "pcmpgtb",
+            SseOpcode::Pcmpgtw => "pcmpgtw",
+            SseOpcode::Pcmpgtd => "pcmpgtd",
+            SseOpcode::Pcmpgtq => "pcmpgtq",
+            SseOpcode::Pextrb => "pextrb",
+            SseOpcode::Pextrw => "pextrw",
+            SseOpcode::Pextrd => "pextrd",
+            SseOpcode::Pinsrb => "pinsrb",
+            SseOpcode::Pinsrw => "pinsrw",
+            SseOpcode::Pinsrd => "pinsrd",
+            SseOpcode::Pmaxsb => "pmaxsb",
+            SseOpcode::Pmaxsw => "pmaxsw",
+            SseOpcode::Pmaxsd => "pmaxsd",
+            SseOpcode::Pmaxub => "pmaxub",
+            SseOpcode::Pmaxuw => "pmaxuw",
+            SseOpcode::Pmaxud => "pmaxud",
+            SseOpcode::Pminsb => "pminsb",
+            SseOpcode::Pminsw => "pminsw",
+            SseOpcode::Pminsd => "pminsd",
+            SseOpcode::Pminub => "pminub",
+            SseOpcode::Pminuw => "pminuw",
+            SseOpcode::Pminud => "pminud",
+            SseOpcode::Pmovmskb => "pmovmskb",
             SseOpcode::Pmulld => "pmulld",
             SseOpcode::Pmullw => "pmullw",
             SseOpcode::Pmuludq => "pmuludq",
+            SseOpcode::Por => "por",
+            SseOpcode::Pshufb => "pshufb",
+            SseOpcode::Pshufd => "pshufd",
             SseOpcode::Psllw => "psllw",
             SseOpcode::Pslld => "pslld",
             SseOpcode::Psllq => "psllq",
@@ -609,6 +830,13 @@ impl fmt::Debug for SseOpcode {
             SseOpcode::Psubd => "psubd",
             SseOpcode::Psubq => "psubq",
             SseOpcode::Psubw => "psubw",
+            SseOpcode::Psubsb => "psubsb",
+            SseOpcode::Psubsw => "psubsw",
+            SseOpcode::Psubusb => "psubusb",
+            SseOpcode::Psubusw => "psubusw",
+            SseOpcode::Ptest => "ptest",
+            SseOpcode::Punpckhbw => "punpckhbw",
+            SseOpcode::Punpcklbw => "punpcklbw",
             SseOpcode::Pxor => "pxor",
             SseOpcode::Rcpss => "rcpss",
             SseOpcode::Roundss => "roundss",
@@ -664,6 +892,19 @@ pub enum ExtMode {
 }
 
 impl ExtMode {
+    /// Calculate the `ExtMode` from passed bit lengths of the from/to types.
+    pub(crate) fn new(from_bits: u16, to_bits: u16) -> Option<ExtMode> {
+        match (from_bits, to_bits) {
+            (1, 8) | (1, 16) | (1, 32) | (8, 16) | (8, 32) => Some(ExtMode::BL),
+            (1, 64) | (8, 64) => Some(ExtMode::BQ),
+            (16, 32) => Some(ExtMode::WL),
+            (16, 64) => Some(ExtMode::WQ),
+            (32, 64) => Some(ExtMode::LQ),
+            _ => None,
+        }
+    }
+
+    /// Return the source register size in bytes.
     pub(crate) fn src_size(&self) -> u8 {
         match self {
             ExtMode::BL | ExtMode::BQ => 1,
@@ -671,6 +912,8 @@ impl ExtMode {
             ExtMode::LQ => 4,
         }
     }
+
+    /// Return the destination register size in bytes.
     pub(crate) fn dst_size(&self) -> u8 {
         match self {
             ExtMode::BL | ExtMode::WL => 4,
@@ -944,55 +1187,6 @@ impl From<FloatCC> for FcmpImm {
     }
 }
 
-/// A branch target. Either unresolved (basic-block index) or resolved (offset
-/// from end of current instruction).
-#[derive(Clone, Copy, Debug)]
-pub enum BranchTarget {
-    /// An unresolved reference to a MachLabel.
-    Label(MachLabel),
-
-    /// A resolved reference to another instruction, in bytes.
-    ResolvedOffset(isize),
-}
-
-impl ShowWithRRU for BranchTarget {
-    fn show_rru(&self, _mb_rru: Option<&RealRegUniverse>) -> String {
-        match self {
-            BranchTarget::Label(l) => format!("{:?}", l),
-            BranchTarget::ResolvedOffset(offs) => format!("(offset {})", offs),
-        }
-    }
-}
-
-impl BranchTarget {
-    /// Get the label.
-    pub fn as_label(&self) -> Option<MachLabel> {
-        match self {
-            &BranchTarget::Label(l) => Some(l),
-            _ => None,
-        }
-    }
-
-    /// Get the offset as a signed 32 bit byte offset.  This returns the
-    /// offset in bytes between the first byte of the source and the first
-    /// byte of the target.  It does not take into account the Intel-specific
-    /// rule that a branch offset is encoded as relative to the start of the
-    /// following instruction.  That is a problem for the emitter to deal
-    /// with. If a label, returns zero.
-    pub fn as_offset32_or_zero(&self) -> i32 {
-        match self {
-            &BranchTarget::ResolvedOffset(off) => {
-                // Leave a bit of slack so that the emitter is guaranteed to
-                // be able to add the length of the jump instruction encoding
-                // to this value and still have a value in signed-32 range.
-                assert!(off >= -0x7FFF_FF00 && off <= 0x7FFF_FF00);
-                off as i32
-            }
-            _ => 0,
-        }
-    }
-}
-
 /// An operand's size in bits.
 #[derive(Clone, Copy, PartialEq)]
 pub enum OperandSize {
@@ -1001,6 +1195,14 @@ pub enum OperandSize {
 }
 
 impl OperandSize {
+    pub(crate) fn from_bytes(num_bytes: u32) -> Self {
+        match num_bytes {
+            1 | 2 | 4 => OperandSize::Size32,
+            8 => OperandSize::Size64,
+            _ => unreachable!(),
+        }
+    }
+
     pub(crate) fn to_bytes(&self) -> u8 {
         match self {
             Self::Size32 => 4,
@@ -1018,6 +1220,7 @@ impl OperandSize {
 
 /// An x64 memory fence kind.
 #[derive(Clone)]
+#[allow(dead_code)]
 pub enum FenceKind {
     /// `mfence` instruction ("Memory Fence")
     MFence,

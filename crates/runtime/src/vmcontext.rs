@@ -492,6 +492,11 @@ impl VMSharedSignatureIndex {
     pub fn new(value: u32) -> Self {
         Self(value)
     }
+
+    /// Returns the underlying bits of the index.
+    pub fn bits(&self) -> u32 {
+        self.0
+    }
 }
 
 impl Default for VMSharedSignatureIndex {
@@ -577,10 +582,7 @@ impl VMBuiltinFunctionsArray {
             wasmtime_table_grow as usize;
         ptrs[BuiltinFunctionIndex::table_init().index() as usize] = wasmtime_table_init as usize;
         ptrs[BuiltinFunctionIndex::elem_drop().index() as usize] = wasmtime_elem_drop as usize;
-        ptrs[BuiltinFunctionIndex::defined_memory_copy().index() as usize] =
-            wasmtime_defined_memory_copy as usize;
-        ptrs[BuiltinFunctionIndex::imported_memory_copy().index() as usize] =
-            wasmtime_imported_memory_copy as usize;
+        ptrs[BuiltinFunctionIndex::memory_copy().index() as usize] = wasmtime_memory_copy as usize;
         ptrs[BuiltinFunctionIndex::memory_fill().index() as usize] = wasmtime_memory_fill as usize;
         ptrs[BuiltinFunctionIndex::imported_memory_fill().index() as usize] =
             wasmtime_imported_memory_fill as usize;

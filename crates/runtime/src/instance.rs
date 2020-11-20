@@ -11,7 +11,7 @@ use crate::traphandlers::Trap;
 use crate::vmcontext::{
     VMBuiltinFunctionsArray, VMCallerCheckedAnyfunc, VMContext, VMFunctionBody, VMFunctionImport,
     VMGlobalDefinition, VMGlobalImport, VMInterrupts, VMMemoryDefinition, VMMemoryImport,
-    VMSharedSignatureIndex, VMTableDefinition, VMTableImport, VMTrampoline,
+    VMSharedSignatureIndex, VMTableDefinition, VMTableImport,
 };
 use crate::{ExportFunction, ExportGlobal, ExportMemory, ExportTable};
 use memoffset::offset_of;
@@ -28,10 +28,10 @@ use thiserror::Error;
 use wasmtime_environ::entity::{packed_option::ReservedValue, BoxedSlice, EntityRef, PrimaryMap};
 use wasmtime_environ::wasm::{
     DataIndex, DefinedFuncIndex, DefinedGlobalIndex, DefinedMemoryIndex, DefinedTableIndex,
-    ElemIndex, FuncIndex, GlobalIndex, GlobalInit, MemoryIndex, SignatureIndex, TableElementType,
-    TableIndex, WasmType,
+    ElemIndex, EntityIndex, FuncIndex, GlobalIndex, GlobalInit, MemoryIndex, SignatureIndex,
+    TableElementType, TableIndex, WasmType,
 };
-use wasmtime_environ::{ir, DataInitializer, EntityIndex, Module, TableElements, VMOffsets};
+use wasmtime_environ::{ir, DataInitializer, Module, TableElements, VMOffsets};
 
 /// A WebAssembly instance.
 ///
@@ -40,9 +40,6 @@ use wasmtime_environ::{ir, DataInitializer, EntityIndex, Module, TableElements, 
 pub(crate) struct Instance {
     /// The `Module` this `Instance` was instantiated from.
     module: Arc<Module>,
-
-    /// The module's JIT code (if exists).
-    code: Arc<dyn Any>,
 
     /// Offsets in the `vmctx` region.
     offsets: VMOffsets,
@@ -62,18 +59,8 @@ pub(crate) struct Instance {
     /// get removed. A missing entry is considered equivalent to an empty slice.
     passive_data: RefCell<HashMap<DataIndex, Arc<[u8]>>>,
 
-    /// Pointers to functions in executable memory.
-    finished_functions: BoxedSlice<DefinedFuncIndex, *mut [VMFunctionBody]>,
-
-    /// Pointers to trampoline functions used to enter particular signatures
-    trampolines: HashMap<VMSharedSignatureIndex, VMTrampoline>,
-
     /// Hosts can store arbitrary per-instance information here.
     host_state: Box<dyn Any>,
-
-    /// Externally allocated data indicating how this instance will be
-    /// interrupted.
-    pub(crate) interrupts: Arc<VMInterrupts>,
 
     /// Additional context used by compiled wasm code. This field is last, and
     /// represents a dynamically-sized array that extends beyond the nominal
@@ -335,6 +322,10 @@ impl Instance {
                 global: self.module.globals[*index],
             }
             .into(),
+
+            // FIXME(#2094)
+            EntityIndex::Instance(_index) => unimplemented!(),
+            EntityIndex::Module(_index) => unimplemented!(),
         }
     }
 
@@ -604,29 +595,31 @@ impl Instance {
         // dropping a non-passive element is a no-op (not a trap).
     }
 
-    /// Do a `memory.copy` for a locally defined memory.
+    /// Do a `memory.copy`
     ///
     /// # Errors
     ///
     /// Returns a `Trap` error when the source or destination ranges are out of
     /// bounds.
-    pub(crate) fn defined_memory_copy(
+    pub(crate) fn memory_copy(
         &self,
-        memory_index: DefinedMemoryIndex,
+        dst_index: MemoryIndex,
         dst: u32,
+        src_index: MemoryIndex,
         src: u32,
         len: u32,
     ) -> Result<(), Trap> {
         // https://webassembly.github.io/reference-types/core/exec/instructions.html#exec-memory-copy
 
-        let memory = self.memory(memory_index);
+        let src_mem = self.get_memory(src_index);
+        let dst_mem = self.get_memory(dst_index);
 
         if src
             .checked_add(len)
-            .map_or(true, |n| n as usize > memory.current_length)
+            .map_or(true, |n| n as usize > src_mem.current_length)
             || dst
                 .checked_add(len)
-                .map_or(true, |m| m as usize > memory.current_length)
+                .map_or(true, |m| m as usize > dst_mem.current_length)
         {
             return Err(Trap::wasm(ir::TrapCode::HeapOutOfBounds));
         }
@@ -637,29 +630,12 @@ impl Instance {
         // Bounds and casts are checked above, by this point we know that
         // everything is safe.
         unsafe {
-            let dst = memory.base.add(dst);
-            let src = memory.base.add(src);
+            let dst = dst_mem.base.add(dst);
+            let src = src_mem.base.add(src);
             ptr::copy(src, dst, len as usize);
         }
 
         Ok(())
-    }
-
-    /// Perform a `memory.copy` on an imported memory.
-    pub(crate) fn imported_memory_copy(
-        &self,
-        memory_index: MemoryIndex,
-        dst: u32,
-        src: u32,
-        len: u32,
-    ) -> Result<(), Trap> {
-        let import = self.imported_memory(memory_index);
-        unsafe {
-            let foreign_instance = (&*import.vmctx).instance();
-            let foreign_memory = &*import.from;
-            let foreign_index = foreign_instance.memory_index(foreign_memory);
-            foreign_instance.defined_memory_copy(foreign_index, dst, src, len)
-        }
     }
 
     /// Perform the `memory.fill` operation on a locally defined memory.
@@ -835,14 +811,12 @@ impl InstanceHandle {
     /// instance.
     pub unsafe fn new(
         module: Arc<Module>,
-        code: Arc<dyn Any>,
-        finished_functions: BoxedSlice<DefinedFuncIndex, *mut [VMFunctionBody]>,
-        trampolines: HashMap<VMSharedSignatureIndex, VMTrampoline>,
+        finished_functions: &PrimaryMap<DefinedFuncIndex, *mut [VMFunctionBody]>,
         imports: Imports,
         mem_creator: Option<&dyn RuntimeMemoryCreator>,
-        vmshared_signatures: BoxedSlice<SignatureIndex, VMSharedSignatureIndex>,
+        lookup_shared_signature: &dyn Fn(SignatureIndex) -> VMSharedSignatureIndex,
         host_state: Box<dyn Any>,
-        interrupts: Arc<VMInterrupts>,
+        interrupts: *const VMInterrupts,
         externref_activations_table: *mut VMExternRefActivationsTable,
         stack_map_registry: *mut StackMapRegistry,
     ) -> Result<Self, InstantiationError> {
@@ -873,16 +847,12 @@ impl InstanceHandle {
         let handle = {
             let instance = Instance {
                 module,
-                code,
                 offsets,
                 memories,
                 tables,
                 passive_elements: Default::default(),
                 passive_data,
-                finished_functions,
-                trampolines,
                 host_state,
-                interrupts,
                 vmctx: VMContext {},
             };
             let layout = instance.alloc_layout();
@@ -897,12 +867,12 @@ impl InstanceHandle {
         };
         let instance = handle.instance();
 
-        debug_assert_eq!(vmshared_signatures.len(), handle.module().signatures.len());
-        ptr::copy(
-            vmshared_signatures.values().as_slice().as_ptr(),
-            instance.signature_ids_ptr() as *mut VMSharedSignatureIndex,
-            vmshared_signatures.len(),
-        );
+        let mut ptr = instance.signature_ids_ptr();
+        for (signature, _) in handle.module().signatures.iter() {
+            *ptr = lookup_shared_signature(signature);
+            ptr = ptr.add(1);
+        }
+
         debug_assert_eq!(imports.functions.len(), handle.module().num_imported_funcs);
         ptr::copy(
             imports.functions.as_ptr(),
@@ -949,7 +919,7 @@ impl InstanceHandle {
             instance.builtin_functions_ptr() as *mut VMBuiltinFunctionsArray,
             VMBuiltinFunctionsArray::initialized(),
         );
-        *instance.interrupts() = &*instance.interrupts;
+        *instance.interrupts() = interrupts;
         *instance.externref_activations_table() = externref_activations_table;
         *instance.stack_map_registry() = stack_map_registry;
 
@@ -959,7 +929,7 @@ impl InstanceHandle {
             let (func_ptr, vmctx) =
                 if let Some(def_index) = instance.module.defined_func_index(index) {
                     (
-                        NonNull::new(instance.finished_functions[def_index] as *mut _).unwrap(),
+                        NonNull::new(finished_functions[def_index] as *mut _).unwrap(),
                         instance.vmctx_ptr(),
                     )
                 } else {
@@ -1152,11 +1122,6 @@ impl InstanceHandle {
         self.instance().get_defined_table(index)
     }
 
-    /// Gets the trampoline pre-registered for a particular signature
-    pub fn trampoline(&self, sig: VMSharedSignatureIndex) -> Option<VMTrampoline> {
-        self.instance().trampolines.get(&sig).cloned()
-    }
-
     /// Return a reference to the contained `Instance`.
     pub(crate) fn instance(&self) -> &Instance {
         unsafe { &*(self.instance as *const Instance) }
@@ -1305,15 +1270,19 @@ fn initialize_tables(instance: &Instance) -> Result<(), InstantiationError> {
         }
 
         for (i, func_idx) in init.elements.iter().enumerate() {
-            let anyfunc = instance.get_caller_checked_anyfunc(*func_idx).map_or(
-                ptr::null_mut(),
-                |f: &VMCallerCheckedAnyfunc| {
-                    f as *const VMCallerCheckedAnyfunc as *mut VMCallerCheckedAnyfunc
-                },
-            );
-            table
-                .set(u32::try_from(start + i).unwrap(), anyfunc.into())
-                .unwrap();
+            let item = match table.element_type() {
+                TableElementType::Func => instance
+                    .get_caller_checked_anyfunc(*func_idx)
+                    .map_or(ptr::null_mut(), |f: &VMCallerCheckedAnyfunc| {
+                        f as *const VMCallerCheckedAnyfunc as *mut VMCallerCheckedAnyfunc
+                    })
+                    .into(),
+                TableElementType::Val(_) => {
+                    assert!(*func_idx == FuncIndex::reserved_value());
+                    TableElement::ExternRef(None)
+                }
+            };
+            table.set(u32::try_from(start + i).unwrap(), item).unwrap();
         }
     }
 

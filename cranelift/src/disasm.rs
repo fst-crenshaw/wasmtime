@@ -1,3 +1,4 @@
+use anyhow::Result;
 use cfg_if::cfg_if;
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::{binemit, ir};
@@ -18,22 +19,6 @@ impl PrintRelocs {
 }
 
 impl binemit::RelocSink for PrintRelocs {
-    fn reloc_block(
-        &mut self,
-        where_: binemit::CodeOffset,
-        r: binemit::Reloc,
-        offset: binemit::CodeOffset,
-    ) {
-        if self.flag_print {
-            writeln!(
-                &mut self.text,
-                "reloc_block: {} {} at {}",
-                r, offset, where_
-            )
-            .unwrap();
-        }
-    }
-
     fn reloc_external(
         &mut self,
         where_: binemit::CodeOffset,
@@ -124,30 +109,34 @@ cfg_if! {
         use capstone::prelude::*;
         use target_lexicon::Architecture;
 
-        fn get_disassembler(isa: &dyn TargetIsa) -> Result<Capstone, String> {
+        fn get_disassembler(isa: &dyn TargetIsa) -> Result<Capstone> {
             let cs = match isa.triple().architecture {
-                Architecture::Riscv32 | Architecture::Riscv64 => {
-                    return Err(String::from("No disassembler for RiscV"))
+                Architecture::Riscv32(_) | Architecture::Riscv64(_) => {
+                    anyhow::bail!("No disassembler for RiscV");
                 }
-                Architecture::I386 | Architecture::I586 | Architecture::I686 => Capstone::new()
+                Architecture::X86_32(_) => Capstone::new()
                     .x86()
                     .mode(arch::x86::ArchMode::Mode32)
-                    .build(),
+                    .build()
+                    .map_err(map_caperr)?,
                 Architecture::X86_64 => Capstone::new()
                     .x86()
                     .mode(arch::x86::ArchMode::Mode64)
-                    .build(),
+                    .build()
+                    .map_err(map_caperr)?,
                 Architecture::Arm(arm) => {
                     if arm.is_thumb() {
                         Capstone::new()
                             .arm()
                             .mode(arch::arm::ArchMode::Thumb)
                             .build()
+                            .map_err(map_caperr)?
                     } else {
                         Capstone::new()
                             .arm()
                             .mode(arch::arm::ArchMode::Arm)
                             .build()
+                            .map_err(map_caperr)?
                     }
                 }
                 Architecture::Aarch64 {..} => {
@@ -155,22 +144,22 @@ cfg_if! {
                         .arm64()
                         .mode(arch::arm64::ArchMode::Arm)
                         .build()
-                        .map_err(|err| err.to_string())?;
+                        .map_err(map_caperr)?;
                     // AArch64 uses inline constants rather than a separate constant pool right now.
                     // Without this option, Capstone will stop disassembling as soon as it sees
                     // an inline constant that is not also a valid instruction. With this option,
                     // Capstone will print a `.byte` directive with the bytes of the inline constant
                     // and continue to the next instruction.
-                    cs.set_skipdata(true).map_err(|err| err.to_string())?;
-                    Ok(cs)
+                    cs.set_skipdata(true).map_err(map_caperr)?;
+                    cs
                 }
-                _ => return Err(String::from("Unknown ISA")),
+                _ => anyhow::bail!("Unknown ISA"),
             };
 
-            cs.map_err(|err| err.to_string())
+            Ok(cs)
         }
 
-        pub fn print_disassembly(isa: &dyn TargetIsa, mem: &[u8]) -> Result<(), String> {
+        pub fn print_disassembly(isa: &dyn TargetIsa, mem: &[u8]) -> Result<()> {
             let cs = get_disassembler(isa)?;
 
             println!("\nDisassembly of {} bytes:", mem.len());
@@ -208,8 +197,12 @@ cfg_if! {
             }
             Ok(())
         }
+
+        fn map_caperr(err: capstone::Error) -> anyhow::Error{
+            anyhow::format_err!("{}", err)
+        }
     } else {
-        pub fn print_disassembly(_: &dyn TargetIsa, _: &[u8]) -> Result<(), String> {
+        pub fn print_disassembly(_: &dyn TargetIsa, _: &[u8]) -> Result<()> {
             println!("\nNo disassembly available.");
             Ok(())
         }
@@ -224,7 +217,7 @@ pub fn print_all(
     relocs: &PrintRelocs,
     traps: &PrintTraps,
     stack_maps: &PrintStackMaps,
-) -> Result<(), String> {
+) -> Result<()> {
     print_bytes(&mem);
     print_disassembly(isa, &mem[0..code_size as usize])?;
     print_readonly_data(&mem[code_size as usize..(code_size + rodata_size) as usize]);

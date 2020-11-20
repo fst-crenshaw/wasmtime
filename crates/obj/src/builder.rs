@@ -98,7 +98,7 @@ fn to_object_architecture(
 ) -> Result<Architecture, anyhow::Error> {
     use target_lexicon::Architecture::*;
     Ok(match arch {
-        I386 | I586 | I686 => Architecture::I386,
+        X86_32(_) => Architecture::I386,
         X86_64 => Architecture::X86_64,
         Arm(_) => Architecture::Arm,
         Aarch64(_) => Architecture::Aarch64,
@@ -122,10 +122,6 @@ fn process_unwind_info(info: &UnwindInfo, obj: &mut Object, code_section: Sectio
 
 /// Builds ELF image from the module `Compilation`.
 // const CODE_SECTION_ALIGNMENT: u64 = 0x1000;
-// assert_eq!(
-//     isa.triple().architecture.endianness(),
-//     Ok(target_lexicon::Endianness::Little)
-// );
 
 /// Iterates through all `LibCall` members and all runtime exported functions.
 #[macro_export]
@@ -223,7 +219,10 @@ impl ObjectBuilderTarget {
         Ok(Self {
             binary_format: BinaryFormat::Elf,
             architecture: to_object_architecture(arch)?,
-            endianness: Endianness::Little,
+            endianness: match arch.endianness().unwrap() {
+                target_lexicon::Endianness::Little => object::Endianness::Little,
+                target_lexicon::Endianness::Big => object::Endianness::Big,
+            },
         })
     }
 
@@ -238,6 +237,7 @@ impl ObjectBuilderTarget {
             target_lexicon::BinaryFormat::Unknown => {
                 bail!("binary format is unknown");
             }
+            other => bail!("binary format {} is unsupported", other),
         };
         let architecture = to_object_architecture(triple.architecture)?;
         let endianness = match triple.endianness().unwrap() {

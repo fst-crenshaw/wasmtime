@@ -16,6 +16,7 @@ use dummy::dummy_imports;
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+use std::time::Duration;
 use wasmtime::*;
 use wasmtime_wast::WastContext;
 
@@ -43,6 +44,7 @@ fn log_wat(wat: &str) {
 
     let i = CNT.fetch_add(1, SeqCst);
     let name = format!("testcase{}.wat", i);
+    log::debug!("wrote wat file to `{}`", name);
     std::fs::write(&name, wat).expect("failed to write wat file");
 }
 
@@ -53,7 +55,7 @@ fn log_wat(wat: &str) {
 ///
 /// You can control which compiler is used via passing a `Strategy`.
 pub fn instantiate(wasm: &[u8], strategy: Strategy) {
-    instantiate_with_config(wasm, crate::fuzz_default_config(strategy).unwrap());
+    instantiate_with_config(wasm, crate::fuzz_default_config(strategy).unwrap(), None);
 }
 
 /// Instantiate the Wasm buffer, and implicitly fail if we have an unexpected
@@ -62,11 +64,20 @@ pub fn instantiate(wasm: &[u8], strategy: Strategy) {
 /// The engine will be configured using provided config.
 ///
 /// See also `instantiate` functions.
-pub fn instantiate_with_config(wasm: &[u8], config: Config) {
+pub fn instantiate_with_config(wasm: &[u8], mut config: Config, timeout: Option<Duration>) {
     crate::init_fuzzing();
 
+    config.interruptable(timeout.is_some());
     let engine = Engine::new(&config);
     let store = Store::new(&engine);
+
+    if let Some(timeout) = timeout {
+        let handle = store.interrupt_handle().unwrap();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            handle.interrupt();
+        });
+    }
 
     log_wasm(wasm);
     let module = match Module::new(&engine, wasm) {
@@ -109,9 +120,8 @@ pub fn compile(wasm: &[u8], strategy: Strategy) {
 /// exports. Modulo OOM, non-canonical NaNs, and usage of Wasm features that are
 /// or aren't enabled for different configs, we should get the same results when
 /// we call the exported functions for all of our different configs.
-#[cfg(feature = "binaryen")]
 pub fn differential_execution(
-    ttf: &crate::generators::WasmOptTtf,
+    module: &wasm_smith::Module,
     configs: &[crate::generators::DifferentialConfig],
 ) {
     use std::collections::{HashMap, HashSet};
@@ -134,13 +144,14 @@ pub fn differential_execution(
     };
 
     let mut export_func_results: HashMap<String, Result<Box<[Val]>, Trap>> = Default::default();
-    log_wasm(&ttf.wasm);
+    let wasm = module.to_bytes();
+    log_wasm(&wasm);
 
     for config in &configs {
         let engine = Engine::new(config);
         let store = Store::new(&engine);
 
-        let module = match Module::new(&engine, &ttf.wasm) {
+        let module = match Module::new(&engine, &wasm) {
             Ok(module) => module,
             // The module might rely on some feature that our config didn't
             // enable or something like that.
@@ -268,7 +279,6 @@ pub fn differential_execution(
 }
 
 /// Invoke the given API calls.
-#[cfg(feature = "binaryen")]
 pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
     use crate::generators::api::ApiCall;
     use std::collections::HashMap;
@@ -313,8 +323,9 @@ pub fn make_api_calls(api: crate::generators::api::ApiCalls) {
 
             ApiCall::ModuleNew { id, wasm } => {
                 log::debug!("creating module: {}", id);
-                log_wasm(&wasm.wasm);
-                let module = match Module::new(engine.as_ref().unwrap(), &wasm.wasm) {
+                let wasm = wasm.to_bytes();
+                log_wasm(&wasm);
+                let module = match Module::new(engine.as_ref().unwrap(), &wasm) {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
